@@ -3,12 +3,13 @@
 """
 CakBro 2.10.4 — Safe Exam Browser (Python cross-platform port)
 
-AV-SAFE + MOUSE-SAFE + HOTKEY-FIXED:
-  - Pakai Win32 RegisterHotKey (bukan library `keyboard`) -> AV tidak mendeteksi keylogger.
-  - Tidak memakai pynput.suppress -> mouse berfungsi normal.
-  - RegisterHotKey dilakukan DI DALAM thread message loop -> WM_HOTKEY benar-benar diterima.
+AV-SAFE + MOUSE-SAFE + HOTKEY-FIXED + INPUT-FOCUS-FIXED:
+  - Win32 RegisterHotKey (bukan library `keyboard`) -> AV clean.
+  - Tidak memakai pynput.suppress -> mouse normal.
+  - RegisterHotKey di dalam thread message loop -> WM_HOTKEY diterima.
   - Exit hotkey: Ctrl+Alt+Shift+Q (utama), Ctrl+Alt+Q (fallback).
-  - Event dari hotkey thread dikirim ke main thread via Queue (thread-safe).
+  - Event dari hotkey thread -> Queue -> main thread.
+  - keep_focus TIDAK mengganggu fokus input teks (cek geometri dulu).
 """
 
 from __future__ import annotations
@@ -34,7 +35,7 @@ from typing import Callable, Dict, List, Optional, Tuple
 import tkinter as tk
 from tkinter import messagebox
 
-# ---------- optional deps (hanya untuk non-Windows) ----------
+# ---------- optional deps ----------
 try:
     import psutil
     HAS_PSUTIL = True
@@ -47,7 +48,6 @@ try:
 except ImportError:
     HAS_REQUESTS = False
 
-# `keyboard` HANYA dipakai sebagai fallback di Linux/macOS.
 if platform.system() != "Windows":
     try:
         import keyboard as kb_lib
@@ -83,6 +83,11 @@ BRIDGE_MARKER   = "|CAKBRO_AHK|"
 
 EXIT_HOTKEY     = "ctrl+alt+shift+q"
 POLL_EXIT_MS    = 250
+
+# Interval keep_focus (ms). Jangan terlalu kecil — bisa ganggu fokus input.
+KEEP_FOCUS_MS   = 800
+# Toleransi deteksi perubahan geometri window (piksel).
+GEOM_TOLERANCE  = 2
 
 
 # ============================================================
@@ -149,6 +154,9 @@ if IS_WINDOWS:
     user32.PostThreadMessageW.argtypes  = [wt.DWORD, wt.UINT, wt.WPARAM, wt.LPARAM]
     kernel32.GetCurrentThreadId.restype = wt.DWORD
 
+    user32.GetWindowRect.argtypes       = [wt.HWND, ctypes.POINTER(wt.RECT)]
+    user32.GetWindowRect.restype        = wt.BOOL
+
     WM_HOTKEY    = 0x0312
     WM_QUIT_     = 0x0012
     PM_NOREMOVE  = 0x0000
@@ -162,14 +170,11 @@ if IS_WINDOWS:
 class WindowsHotkeyManager:
     """
     Manajemen hotkey native Windows via RegisterHotKey.
-
-    PENTING: RegisterHotKey dan GetMessageW HARUS berjalan di thread
-    yang SAMA, karena dengan hwnd=NULL Windows memposting WM_HOTKEY ke
-    message queue milik thread pemanggil RegisterHotKey.
+    RegisterHotKey dan GetMessageW HARUS di thread yang SAMA.
     """
 
     def __init__(self):
-        self._hotkeys: Dict[int, list] = {}   # hid -> [mods, vk, callback, registered]
+        self._hotkeys: Dict[int, list] = {}
         self._next_id = 1
         self._thread: Optional[threading.Thread] = None
         self._thread_id = 0
@@ -178,7 +183,6 @@ class WindowsHotkeyManager:
         self._lock = threading.Lock()
 
     def register(self, mods: int, vk: int, callback: Callable) -> int:
-        """Queue hotkey untuk didaftarkan di thread message loop."""
         with self._lock:
             hid = self._next_id
             self._next_id += 1
@@ -197,11 +201,9 @@ class WindowsHotkeyManager:
     def _loop(self) -> None:
         self._thread_id = kernel32.GetCurrentThreadId()
 
-        # 1) Paksa message queue thread ini dibuat
         dummy = MSG()
         user32.PeekMessageW(ctypes.byref(dummy), None, 0, 0, PM_NOREMOVE)
 
-        # 2) Register SEMUA hotkey DI THREAD INI
         ok = fail = 0
         with self._lock:
             for hid, entry in self._hotkeys.items():
@@ -223,7 +225,6 @@ class WindowsHotkeyManager:
 
         self._ready.set()
 
-        # 3) Message loop
         msg = MSG()
         while self._running:
             ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
@@ -258,7 +259,7 @@ class WindowsHotkeyManager:
 
 
 # ============================================================
-# VK CODES + BLOCK LIST (Windows)
+# VK CODES + BLOCK LIST
 # ============================================================
 VK = {
     **{c: ord(c.upper()) for c in "abcdefghijklmnopqrstuvwxyz"},
@@ -272,7 +273,6 @@ VK = {
 }
 
 BLOCK_HOTKEYS_WIN = [
-    # ---------- Win + X ----------
     (MOD_WIN, "r"), (MOD_WIN, "e"), (MOD_WIN, "d"), (MOD_WIN, "l"),
     (MOD_WIN, "x"), (MOD_WIN, "s"), (MOD_WIN, "q"), (MOD_WIN, "i"),
     (MOD_WIN, "a"), (MOD_WIN, "tab"), (MOD_WIN, "m"), (MOD_WIN, "b"),
@@ -283,12 +283,9 @@ BLOCK_HOTKEYS_WIN = [
     (MOD_WIN, "1"), (MOD_WIN, "2"), (MOD_WIN, "3"), (MOD_WIN, "4"),
     (MOD_WIN, "5"), (MOD_WIN, "6"), (MOD_WIN, "7"), (MOD_WIN, "8"),
     (MOD_WIN, "9"), (MOD_WIN, "0"),
-    # ---------- Alt + X ----------
     (MOD_ALT, "tab"), (MOD_ALT, "f4"), (MOD_ALT, "escape"), (MOD_ALT, "space"),
-    # ---------- Ctrl + X ----------
     (MOD_CONTROL, "escape"), (MOD_CONTROL | MOD_SHIFT, "escape"),
     (MOD_CONTROL | MOD_ALT, "delete"),
-    # ---------- Browser shortcuts ----------
     (MOD_CONTROL, "t"), (MOD_CONTROL, "n"), (MOD_CONTROL, "w"),
     (MOD_CONTROL, "l"), (MOD_CONTROL, "d"), (MOD_CONTROL, "h"),
     (MOD_CONTROL, "j"), (MOD_CONTROL, "u"), (MOD_CONTROL, "p"),
@@ -298,12 +295,9 @@ BLOCK_HOTKEYS_WIN = [
     (MOD_CONTROL | MOD_SHIFT, "n"), (MOD_CONTROL | MOD_SHIFT, "w"),
     (MOD_CONTROL | MOD_SHIFT, "i"), (MOD_CONTROL | MOD_SHIFT, "j"),
     (MOD_CONTROL | MOD_SHIFT, "c"), (MOD_CONTROL | MOD_SHIFT, "t"),
-    # ---------- F-keys ----------
     (0, "f1"), (0, "f3"), (0, "f6"), (0, "f7"), (0, "f10"),
     (0, "f11"), (0, "f12"),
-    # ---------- Print Screen ----------
     (0, "print"), (MOD_ALT, "print"), (MOD_CONTROL, "print"),
-    # ---------- Misc ----------
     (0, "apps"),
     (MOD_CONTROL | MOD_ALT, "a"), (MOD_CONTROL | MOD_ALT, "s"),
 ]
@@ -326,15 +320,12 @@ def _dispatch_exit_hotkey():
 
 
 def setup_hotkey_windows() -> Optional[WindowsHotkeyManager]:
-    """Windows: pakai RegisterHotKey native (AV-safe)."""
     mgr = WindowsHotkeyManager()
 
-    # --- Exit hotkeys (2 varian) ---
     mgr.register(MOD_CONTROL | MOD_ALT | MOD_SHIFT, VK["q"], _dispatch_exit_hotkey)
     mgr.register(MOD_CONTROL | MOD_ALT,             VK["q"], _dispatch_exit_hotkey)
     log_info("Exit hotkey queued: Ctrl+Alt+Shift+Q dan Ctrl+Alt+Q")
 
-    # --- Blocker hotkeys ---
     queued = 0
     for mods, key in BLOCK_HOTKEYS_WIN:
         vk = VK.get(key)
@@ -344,7 +335,6 @@ def setup_hotkey_windows() -> Optional[WindowsHotkeyManager]:
         queued += 1
     log_info(f"Blocker queued: {queued} hotkey")
 
-    # --- Start (register + message loop di thread yang sama) ---
     ready = mgr.start(wait_timeout=5.0)
     if not ready:
         print("[WARN] Hotkey thread tidak siap dalam 5 detik.")
@@ -354,14 +344,12 @@ def setup_hotkey_windows() -> Optional[WindowsHotkeyManager]:
 
 
 def setup_hotkey_fallback() -> Optional[object]:
-    """Linux/macOS fallback: pakai library keyboard."""
     if not HAS_KB:
         log_info("Fallback 'keyboard' tidak terpasang. Hotkey blocker nonaktif.")
         return None
     try:
         kb_lib.add_hotkey(EXIT_HOTKEY, _dispatch_exit_hotkey,
                           suppress=False, trigger_on_release=False)
-        # Tambahan varian Ctrl+Alt+Q
         try:
             kb_lib.add_hotkey("ctrl+alt+q", _dispatch_exit_hotkey,
                               suppress=False, trigger_on_release=False)
@@ -495,15 +483,40 @@ def find_window_by_pid_windows(pid: int) -> Optional[int]:
     return result["hwnd"]
 
 
+def _get_window_rect(hwnd: int) -> Optional[Tuple[int, int, int, int]]:
+    if not IS_WINDOWS:
+        return None
+    try:
+        r = wt.RECT()
+        if user32.GetWindowRect(hwnd, ctypes.byref(r)):
+            return (r.left, r.top, r.right - r.left, r.bottom - r.top)
+    except Exception:
+        pass
+    return None
+
+
 def resize_external_window(pid: int, x: int, y: int, w: int, h: int) -> None:
+    """
+    Ubah ukuran window browser. PENTING: hanya panggil SetWindowPos bila
+    geometri benar-benar berbeda. Panggilan berulang tanpa perubahan
+    mengganggu state fokus input teks di Chrome/Edge.
+    """
     if IS_WINDOWS:
         hwnd = find_window_by_pid_windows(pid)
         if hwnd:
-            HWND_TOP = 0
+            current = _get_window_rect(hwnd)
+            if current is not None:
+                cx, cy, cw, ch = current
+                if (abs(cx - x) <= GEOM_TOLERANCE and
+                        abs(cy - y) <= GEOM_TOLERANCE and
+                        abs(cw - w) <= GEOM_TOLERANCE and
+                        abs(ch - h) <= GEOM_TOLERANCE):
+                    return  # sudah benar, JANGAN sentuh
             SWP_NOACTIVATE = 0x0010
-            SWP_SHOWWINDOW = 0x0040
-            ctypes.windll.user32.SetWindowPos(hwnd, HWND_TOP, x, y, w, h,
-                                              SWP_NOACTIVATE | SWP_SHOWWINDOW)
+            SWP_NOZORDER   = 0x0004
+            # hWndInsertAfter = 0 (diabaikan karena SWP_NOZORDER)
+            user32.SetWindowPos(hwnd, 0, x, y, w, h,
+                                SWP_NOACTIVATE | SWP_NOZORDER)
             return
     if IS_LINUX:
         try:
@@ -949,8 +962,6 @@ class CakBroApp:
         self.browser_h = self.mon_h - BAR_HEIGHT
 
         self._hotkey_handle = None
-
-        # ---- thread-safe hotkey event queue ----
         self._hotkey_queue: "_queue.Queue" = _queue.Queue()
 
         global _exit_hotkey_cb
@@ -976,7 +987,7 @@ class CakBroApp:
         self.root.after(500, self.security_check)
         self.root.after(1000, self.update_clock)
         self.root.after(250, self.poll_bridge)
-        self.root.after(300, self.keep_focus)
+        self.root.after(KEEP_FOCUS_MS, self.keep_focus)
         self.root.after(80, self._poll_hotkey_queue)
 
     # ---------------- browser ----------------
@@ -1131,6 +1142,7 @@ class CakBroApp:
     def _setup_browser_window(self):
         if not self.browser_proc:
             return
+        # Panggilan pertama: posisikan & resize.
         resize_external_window(self.browser_proc.pid, 0, 0, self.mon_w, self.browser_h)
 
     # ---------------- splash ----------------
@@ -1228,17 +1240,23 @@ class CakBroApp:
         self.root.after(1000, self.update_clock)
 
     def keep_focus(self):
-        if self.bar_win and self.bar_win.winfo_exists():
-            try:
-                self.bar_win.attributes("-topmost", True)
-                self.bar_win.lift()
-            except Exception:
-                pass
+        """
+        PENTING:
+        - JANGAN panggil lift()/attributes() pada bar setiap tick.
+        - JANGAN resize window kalau geometrinya sudah benar.
+        - Untuk overlay warning/expired, re-lift hanya kalau ada.
+        Tujuan: tidak mengganggu fokus input teks di browser.
+        """
         if self.is_exiting or self.is_home_resetting:
-            self.root.after(300, self.keep_focus)
+            self.root.after(KEEP_FOCUS_MS, self.keep_focus)
             return
+
+        # Pastikan browser berada di geometri yang benar.
+        # resize_external_window() sudah cek dulu; kalau sama -> tidak lakukan apa-apa.
         if self.browser_proc and self.browser_proc.poll() is None:
             resize_external_window(self.browser_proc.pid, 0, 0, self.mon_w, self.browser_h)
+
+        # Overlay warning/expired memang harus selalu di atas browser.
         if self.expired_win and self.expired_win.winfo_exists():
             try:
                 self.expired_win.attributes("-topmost", True)
@@ -1251,11 +1269,15 @@ class CakBroApp:
                 self.warning_win.lift()
             except Exception:
                 pass
-        self.root.after(300, self.keep_focus)
+
+        # CATATAN: bar TIDAK di-lift tiap tick. Bar dan browser tidak overlap
+        # (browser tinggi = screen_h - BAR_HEIGHT, bar di bawahnya), sehingga
+        # bar tidak perlu diangkat ulang.
+
+        self.root.after(KEEP_FOCUS_MS, self.keep_focus)
 
     # ---------------- hotkey queue ----------------
     def _poll_hotkey_queue(self):
-        """Selalu dijalankan di main thread tkinter — konsumsi event hotkey."""
         try:
             while True:
                 msg = self._hotkey_queue.get_nowait()
@@ -1544,14 +1566,12 @@ class CakBroApp:
 
     # ---------------- exit ----------------
     def trigger_exit(self):
-        """Dipanggil dari thread manapun — hanya enqueue."""
         try:
             self._hotkey_queue.put_nowait("exit")
         except Exception as e:
             log_update(f"trigger_exit enqueue gagal: {e}")
 
     def _real_trigger_exit(self):
-        """Selalu dijalankan di main thread tkinter."""
         if self.is_exiting:
             return
         self.is_exiting = True
