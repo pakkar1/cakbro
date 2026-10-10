@@ -2,8 +2,13 @@
 # -*- coding: utf-8 -*-
 """
 CakBro 2.10.4 — Safe Exam Browser (Python cross-platform port)
-AV-SAFE VERSION: pakai Win32 RegisterHotKey (bukan library `keyboard`)
-                 tanpa suppress mouse, sehingga antivirus tidak false-positive.
+
+AV-SAFE + MOUSE-SAFE + HOTKEY-FIXED:
+  - Pakai Win32 RegisterHotKey (bukan library `keyboard`) -> AV tidak mendeteksi keylogger.
+  - Tidak memakai pynput.suppress -> mouse berfungsi normal.
+  - RegisterHotKey dilakukan DI DALAM thread message loop -> WM_HOTKEY benar-benar diterima.
+  - Exit hotkey: Ctrl+Alt+Shift+Q (utama), Ctrl+Alt+Q (fallback).
+  - Event dari hotkey thread dikirim ke main thread via Queue (thread-safe).
 """
 
 from __future__ import annotations
@@ -13,6 +18,7 @@ import hashlib
 import json
 import os
 import platform
+import queue as _queue
 import re
 import shutil
 import signal
@@ -42,7 +48,6 @@ except ImportError:
     HAS_REQUESTS = False
 
 # `keyboard` HANYA dipakai sebagai fallback di Linux/macOS.
-# Di Windows kita pakai Win32 RegisterHotKey (tanpa dependency ini).
 if platform.system() != "Windows":
     try:
         import keyboard as kb_lib
@@ -115,7 +120,7 @@ def log_info(msg: str) -> None:
 
 
 # ============================================================
-# WINDOWS NATIVE HOTKEY MANAGER (via RegisterHotKey)
+# WINDOWS NATIVE HOTKEY MANAGER
 # ============================================================
 if IS_WINDOWS:
     import ctypes.wintypes as wt
@@ -139,11 +144,14 @@ if IS_WINDOWS:
     user32.UnregisterHotKey.restype     = wt.BOOL
     user32.GetMessageW.argtypes         = [ctypes.POINTER(MSG), wt.HWND, wt.UINT, wt.UINT]
     user32.GetMessageW.restype          = ctypes.c_int
+    user32.PeekMessageW.argtypes        = [ctypes.POINTER(MSG), wt.HWND, wt.UINT, wt.UINT, wt.UINT]
+    user32.PeekMessageW.restype         = wt.BOOL
     user32.PostThreadMessageW.argtypes  = [wt.DWORD, wt.UINT, wt.WPARAM, wt.LPARAM]
     kernel32.GetCurrentThreadId.restype = wt.DWORD
 
     WM_HOTKEY    = 0x0312
     WM_QUIT_     = 0x0012
+    PM_NOREMOVE  = 0x0000
     MOD_ALT      = 0x0001
     MOD_CONTROL  = 0x0002
     MOD_SHIFT    = 0x0004
@@ -154,61 +162,80 @@ if IS_WINDOWS:
 class WindowsHotkeyManager:
     """
     Manajemen hotkey native Windows via RegisterHotKey.
-    - Tidak memakai low-level hook -> antivirus tidak mendeteksi keylogger.
-    - Callback dijalankan di thread message loop internal.
+
+    PENTING: RegisterHotKey dan GetMessageW HARUS berjalan di thread
+    yang SAMA, karena dengan hwnd=NULL Windows memposting WM_HOTKEY ke
+    message queue milik thread pemanggil RegisterHotKey.
     """
+
     def __init__(self):
-        self.hotkeys: Dict[int, Tuple[int, int, Callable]] = {}
-        self.next_id = 1
+        self._hotkeys: Dict[int, list] = {}   # hid -> [mods, vk, callback, registered]
+        self._next_id = 1
         self._thread: Optional[threading.Thread] = None
         self._thread_id = 0
+        self._ready = threading.Event()
         self._running = False
         self._lock = threading.Lock()
 
-    def register(self, mods: int, vk: int, callback: Callable) -> bool:
+    def register(self, mods: int, vk: int, callback: Callable) -> int:
+        """Queue hotkey untuk didaftarkan di thread message loop."""
         with self._lock:
-            hid = self.next_id
-            self.next_id += 1
-        # Coba dengan MOD_NOREPEAT, fallback tanpa MOD_NOREPEAT
-        ok = user32.RegisterHotKey(None, hid, mods | MOD_NOREPEAT, vk)
-        if not ok:
-            ok = user32.RegisterHotKey(None, hid, mods, vk)
-        if not ok:
-            return False
-        self.hotkeys[hid] = (mods, vk, callback)
-        return True
+            hid = self._next_id
+            self._next_id += 1
+            self._hotkeys[hid] = [mods, vk, callback, False]
+        return hid
 
-    def start(self) -> None:
+    def start(self, wait_timeout: float = 5.0) -> bool:
         if self._thread is not None:
-            return
+            return True
         self._running = True
         self._thread = threading.Thread(target=self._loop, daemon=True,
                                         name="CakBroHotkeyLoop")
         self._thread.start()
+        return self._ready.wait(timeout=wait_timeout)
 
     def _loop(self) -> None:
         self._thread_id = kernel32.GetCurrentThreadId()
+
+        # 1) Paksa message queue thread ini dibuat
+        dummy = MSG()
+        user32.PeekMessageW(ctypes.byref(dummy), None, 0, 0, PM_NOREMOVE)
+
+        # 2) Register SEMUA hotkey DI THREAD INI
+        ok = fail = 0
+        with self._lock:
+            for hid, entry in self._hotkeys.items():
+                mods, vk, cb, _ = entry
+                registered = user32.RegisterHotKey(None, hid, mods | MOD_NOREPEAT, vk)
+                if not registered:
+                    registered = user32.RegisterHotKey(None, hid, mods, vk)
+                entry[3] = bool(registered)
+                if registered:
+                    ok += 1
+                else:
+                    fail += 1
+                    err = ctypes.get_last_error()
+                    log_update(f"RegisterHotKey FAIL hid={hid} "
+                               f"mods={mods:#x} vk={vk:#x} err={err}")
+
+        log_info(f"Win32 hotkey register: ok={ok} fail={fail} thread_id={self._thread_id}")
+        print(f"[INFO] Win32 hotkey register: ok={ok} fail={fail}")
+
+        self._ready.set()
+
+        # 3) Message loop
         msg = MSG()
         while self._running:
             ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
             if ret in (0, -1):
                 break
             if msg.message == WM_HOTKEY:
-                entry = self.hotkeys.get(int(msg.wParam))
-                if entry:
-                    _mods, _vk, cb = entry
+                entry = self._hotkeys.get(int(msg.wParam))
+                if entry and entry[3]:
                     try:
-                        cb()
+                        entry[2]()
                     except Exception as e:
                         log_update(f"hotkey callback error: {e}")
-
-    def unregister_all(self) -> None:
-        for hid in list(self.hotkeys.keys()):
-            try:
-                user32.UnregisterHotKey(None, hid)
-            except Exception:
-                pass
-        self.hotkeys.clear()
 
     def stop(self) -> None:
         self._running = False
@@ -217,31 +244,33 @@ class WindowsHotkeyManager:
                 user32.PostThreadMessageW(self._thread_id, WM_QUIT_, 0, 0)
             except Exception:
                 pass
-        self.unregister_all()
+        if self._thread is not None:
+            try:
+                self._thread.join(timeout=2)
+            except Exception:
+                pass
+        for hid in list(self._hotkeys.keys()):
+            try:
+                user32.UnregisterHotKey(None, hid)
+            except Exception:
+                pass
+        self._hotkeys.clear()
 
 
 # ============================================================
 # VK CODES + BLOCK LIST (Windows)
 # ============================================================
 VK = {
-    # letters
     **{c: ord(c.upper()) for c in "abcdefghijklmnopqrstuvwxyz"},
-    # digits
     **{str(d): 0x30 + d for d in range(10)},
-    # special
     "tab": 0x09, "escape": 0x1B, "space": 0x20, "enter": 0x0D,
     "delete": 0x2E, "insert": 0x2D, "backspace": 0x08,
     "print": 0x2C, "apps": 0x5D,
     ".": 0xBE, ";": 0xBA,
-    # function keys
     **{f"f{i}": 0x6F + i for i in range(1, 13)},
-    # windows keys
     "lwin": 0x5B, "rwin": 0x5C,
 }
 
-# Format: (mods, key)
-# CATATAN: key tanpa mod (mods=0) hanya untuk tombol khusus (F-keys, PrintScreen),
-#          JANGAN untuk huruf/angka karena akan memblokir pengetikan.
 BLOCK_HOTKEYS_WIN = [
     # ---------- Win + X ----------
     (MOD_WIN, "r"), (MOD_WIN, "e"), (MOD_WIN, "d"), (MOD_WIN, "l"),
@@ -269,12 +298,11 @@ BLOCK_HOTKEYS_WIN = [
     (MOD_CONTROL | MOD_SHIFT, "n"), (MOD_CONTROL | MOD_SHIFT, "w"),
     (MOD_CONTROL | MOD_SHIFT, "i"), (MOD_CONTROL | MOD_SHIFT, "j"),
     (MOD_CONTROL | MOD_SHIFT, "c"), (MOD_CONTROL | MOD_SHIFT, "t"),
-    # ---------- F-keys (unmodified) ----------
+    # ---------- F-keys ----------
     (0, "f1"), (0, "f3"), (0, "f6"), (0, "f7"), (0, "f10"),
     (0, "f11"), (0, "f12"),
     # ---------- Print Screen ----------
-    (0, "print"),
-    (MOD_ALT, "print"), (MOD_CONTROL, "print"),
+    (0, "print"), (MOD_ALT, "print"), (MOD_CONTROL, "print"),
     # ---------- Misc ----------
     (0, "apps"),
     (MOD_CONTROL | MOD_ALT, "a"), (MOD_CONTROL | MOD_ALT, "s"),
@@ -282,9 +310,8 @@ BLOCK_HOTKEYS_WIN = [
 
 
 # ============================================================
-# HOTKEY SETUP (multi-platform)
+# HOTKEY SETUP
 # ============================================================
-# Callback global untuk exit
 _exit_hotkey_cb: Optional[Callable] = None
 _win_hotkey_mgr: Optional[WindowsHotkeyManager] = None
 
@@ -298,58 +325,52 @@ def _dispatch_exit_hotkey():
             log_update(f"exit hotkey callback error: {e}")
 
 
-def _vk_to_name(key: str) -> str:
-    return key
-
-
 def setup_hotkey_windows() -> Optional[WindowsHotkeyManager]:
     """Windows: pakai RegisterHotKey native (AV-safe)."""
     mgr = WindowsHotkeyManager()
 
-    # Exit hotkey: Ctrl + Alt + Shift + Q
-    exit_ok = mgr.register(MOD_CONTROL | MOD_ALT | MOD_SHIFT, VK["q"],
-                           _dispatch_exit_hotkey)
-    if exit_ok:
-        log_info("Hotkey exit terdaftar (Win32): Ctrl+Alt+Shift+Q")
-        print("[INFO] Hotkey exit aktif: CTRL+ALT+SHIFT+Q")
-    else:
-        log_info("GAGAL mendaftarkan hotkey exit via RegisterHotKey!")
-        print("[WARN] Hotkey exit tidak bisa didaftarkan. Coba jalankan sebagai Admin.")
+    # --- Exit hotkeys (2 varian) ---
+    mgr.register(MOD_CONTROL | MOD_ALT | MOD_SHIFT, VK["q"], _dispatch_exit_hotkey)
+    mgr.register(MOD_CONTROL | MOD_ALT,             VK["q"], _dispatch_exit_hotkey)
+    log_info("Exit hotkey queued: Ctrl+Alt+Shift+Q dan Ctrl+Alt+Q")
 
-    # Blocker
-    ok = 0
-    fail = 0
+    # --- Blocker hotkeys ---
+    queued = 0
     for mods, key in BLOCK_HOTKEYS_WIN:
         vk = VK.get(key)
         if vk is None:
-            fail += 1
             continue
-        if mgr.register(mods, vk, lambda: None):
-            ok += 1
-        else:
-            fail += 1
+        mgr.register(mods, vk, lambda: None)
+        queued += 1
+    log_info(f"Blocker queued: {queued} hotkey")
 
-    log_info(f"Blocker Win32 aktif: ok={ok} fail={fail}")
-    print(f"[INFO] Hotkey blocker aktif: ok={ok} fail={fail}")
+    # --- Start (register + message loop di thread yang sama) ---
+    ready = mgr.start(wait_timeout=5.0)
+    if not ready:
+        print("[WARN] Hotkey thread tidak siap dalam 5 detik.")
+        log_info("Hotkey thread timeout.")
 
-    mgr.start()
     return mgr
 
 
 def setup_hotkey_fallback() -> Optional[object]:
-    """Linux/macOS fallback: pakai library keyboard (butuh root/Accessibility)."""
+    """Linux/macOS fallback: pakai library keyboard."""
     if not HAS_KB:
         log_info("Fallback 'keyboard' tidak terpasang. Hotkey blocker nonaktif.")
         return None
     try:
         kb_lib.add_hotkey(EXIT_HOTKEY, _dispatch_exit_hotkey,
                           suppress=False, trigger_on_release=False)
-        log_info(f"Hotkey exit (fallback) aktif: {EXIT_HOTKEY}")
-        ok = 0
-        fail = 0
-        # Blocker terbatas (fallback tidak sekuat Win32)
+        # Tambahan varian Ctrl+Alt+Q
+        try:
+            kb_lib.add_hotkey("ctrl+alt+q", _dispatch_exit_hotkey,
+                              suppress=False, trigger_on_release=False)
+        except Exception:
+            pass
+        log_info(f"Hotkey exit (fallback) aktif: {EXIT_HOTKEY} dan ctrl+alt+q")
+        ok = fail = 0
         for mods, key in [
-            (2, "escape"), (3, "escape"),  # ctrl+esc, ctrl+shift+esc
+            (2, "escape"), (3, "escape"),
             (1, "tab"), (1, "f4"), (1, "escape"),
             (2, "t"), (2, "n"), (2, "w"), (2, "l"), (2, "j"), (2, "u"),
             (2, "p"), (2, "s"), (2, "o"),
@@ -357,10 +378,10 @@ def setup_hotkey_fallback() -> Optional[object]:
             (0, "f11"), (0, "f12"),
         ]:
             try:
-                kb_lib.add_hotkey(f"{'ctrl+' if mods & 2 else ''}"
-                                  f"{'alt+' if mods & 1 else ''}"
-                                  f"{'shift+' if mods & 4 else ''}{key}",
-                                  lambda: None, suppress=True)
+                combo = (("ctrl+" if mods & 2 else "") +
+                         ("alt+"  if mods & 1 else "") +
+                         ("shift+" if mods & 4 else "") + key)
+                kb_lib.add_hotkey(combo, lambda: None, suppress=True)
                 ok += 1
             except Exception:
                 fail += 1
@@ -929,6 +950,9 @@ class CakBroApp:
 
         self._hotkey_handle = None
 
+        # ---- thread-safe hotkey event queue ----
+        self._hotkey_queue: "_queue.Queue" = _queue.Queue()
+
         global _exit_hotkey_cb
         _exit_hotkey_cb = self.trigger_exit
 
@@ -953,6 +977,7 @@ class CakBroApp:
         self.root.after(1000, self.update_clock)
         self.root.after(250, self.poll_bridge)
         self.root.after(300, self.keep_focus)
+        self.root.after(80, self._poll_hotkey_queue)
 
     # ---------------- browser ----------------
     def find_browser_step(self):
@@ -1175,7 +1200,7 @@ class CakBroApp:
         self._hotkey_handle = setup_hotkeys()
         if IS_WINDOWS and not _is_admin_windows():
             print("[WARN] CakBro TIDAK berjalan sebagai Administrator.")
-            print("       Blokir tombol Windows/Alt+Tab SUPPRESS mungkin terbatas.")
+            print("       Blokir tombol Windows/Alt+Tab mungkin terbatas.")
             print("       Untuk kiosk penuh, jalankan sebagai Admin.")
 
     # ---------------- timers ----------------
@@ -1227,6 +1252,21 @@ class CakBroApp:
             except Exception:
                 pass
         self.root.after(300, self.keep_focus)
+
+    # ---------------- hotkey queue ----------------
+    def _poll_hotkey_queue(self):
+        """Selalu dijalankan di main thread tkinter — konsumsi event hotkey."""
+        try:
+            while True:
+                msg = self._hotkey_queue.get_nowait()
+                if msg == "exit":
+                    self._real_trigger_exit()
+                    break
+        except _queue.Empty:
+            pass
+        except Exception as e:
+            log_update(f"_poll_hotkey_queue error: {e}")
+        self.root.after(80, self._poll_hotkey_queue)
 
     # ---------------- bridge ----------------
     def poll_bridge(self):
@@ -1490,7 +1530,6 @@ class CakBroApp:
             return
         if not self.browser_proc or self.browser_proc.poll() is not None:
             return
-        # Kirim F5 via SendInput (native, tidak pakai `keyboard`)
         if IS_WINDOWS:
             try:
                 hwnd = find_window_by_pid_windows(self.browser_proc.pid)
@@ -1505,13 +1544,14 @@ class CakBroApp:
 
     # ---------------- exit ----------------
     def trigger_exit(self):
-        """Aman dari thread manapun."""
+        """Dipanggil dari thread manapun — hanya enqueue."""
         try:
-            self.root.after(0, self._real_trigger_exit)
+            self._hotkey_queue.put_nowait("exit")
         except Exception as e:
-            log_update(f"trigger_exit schedule gagal: {e}")
+            log_update(f"trigger_exit enqueue gagal: {e}")
 
     def _real_trigger_exit(self):
+        """Selalu dijalankan di main thread tkinter."""
         if self.is_exiting:
             return
         self.is_exiting = True
