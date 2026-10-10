@@ -3,13 +3,14 @@
 """
 CakBro 2.10.4 — Safe Exam Browser (Python cross-platform port)
 
-AV-SAFE + MOUSE-SAFE + HOTKEY-FIXED + INPUT-FOCUS-FIXED:
-  - Win32 RegisterHotKey (bukan library `keyboard`) -> AV clean.
-  - Tidak memakai pynput.suppress -> mouse normal.
-  - RegisterHotKey di dalam thread message loop -> WM_HOTKEY diterima.
-  - Exit hotkey: Ctrl+Alt+Shift+Q (utama), Ctrl+Alt+Q (fallback).
-  - Event dari hotkey thread -> Queue -> main thread.
-  - keep_focus TIDAK mengganggu fokus input teks (cek geometri dulu).
+Fitur lengkap:
+  - Kiosk browser otomatis: Edge > Chrome > Brave > Firefox
+  - AV-safe (Win32 RegisterHotKey, bukan library keyboard)
+  - Mouse-safe (tanpa pynput.suppress)
+  - Hotkey exit: Ctrl+Alt+Shift+Q (utama), Ctrl+Alt+Q (fallback)
+  - Input fokus stabil (tidak ada resize/lift berulang)
+  - Auto-update cross-platform: Windows / Linux / macOS dari repo cakbro
+  - Bridge via window title + expiry overlay + warning overlay
 """
 
 from __future__ import annotations
@@ -65,9 +66,11 @@ else:
 APP_NAME             = "CakBro"
 APP_VERSION          = "2.10.4"
 EXAM_URL             = "https://ujikom.pakkar.my.id/2026/10/try-out-tka-sby.html"
-UPDATE_MANIFEST_URL  = "https://raw.githubusercontent.com/pakkar1/cakbro-updates/main/latest.ini"
-UPDATE_BINARY_URL    = "https://github.com/pakkar1/cakbro-updates/releases/latest/download/CakBro.exe"
-UPDATE_RELEASE_BASE  = "https://github.com/pakkar1/cakbro-updates/releases/download/v"
+
+# ---- Auto-update (repo: pakkar1/cakbro) ----
+UPDATE_MANIFEST_URL  = "https://raw.githubusercontent.com/pakkar1/cakbro/main/latest.ini"
+UPDATE_RELEASE_BASE  = "https://github.com/pakkar1/cakbro/releases/download/v"
+UPDATE_LATEST_BASE   = "https://github.com/pakkar1/cakbro/releases/latest/download"
 
 PLATFORM   = platform.system()
 IS_WINDOWS = PLATFORM == "Windows"
@@ -83,10 +86,7 @@ BRIDGE_MARKER   = "|CAKBRO_AHK|"
 
 EXIT_HOTKEY     = "ctrl+alt+shift+q"
 POLL_EXIT_MS    = 250
-
-# Interval keep_focus (ms). Jangan terlalu kecil — bisa ganggu fokus input.
 KEEP_FOCUS_MS   = 800
-# Toleransi deteksi perubahan geometri window (piksel).
 GEOM_TOLERANCE  = 2
 
 
@@ -97,6 +97,7 @@ def app_dir() -> Path:
     if getattr(sys, "frozen", False):
         return Path(sys.executable).resolve().parent
     return Path(__file__).resolve().parent
+
 
 def data_dir() -> Path:
     if IS_WINDOWS:
@@ -109,6 +110,7 @@ def data_dir() -> Path:
     d.mkdir(parents=True, exist_ok=True)
     return d
 
+
 def log_update(msg: str) -> None:
     try:
         logdir = data_dir() / "Update"
@@ -119,9 +121,35 @@ def log_update(msg: str) -> None:
     except Exception:
         pass
 
+
 def log_info(msg: str) -> None:
     print(f"[CakBro] {msg}", flush=True)
     log_update(msg)
+
+
+# ============================================================
+# PLATFORM-SPECIFIC ASSET NAME (untuk auto-update)
+# ============================================================
+def platform_asset_name() -> str:
+    """Nama file aset rilis sesuai OS yang menjalankan CakBro."""
+    if IS_WINDOWS:
+        return "CakBro-windows.exe"
+    if IS_LINUX:
+        return "CakBro-linux"
+    if IS_MAC:
+        return "CakBro-macos"
+    return "CakBro.exe"   # fallback
+
+
+def platform_hash_key() -> str:
+    """Kunci baris SHA-256 di latest.ini sesuai OS."""
+    if IS_WINDOWS:
+        return "sha256_windows"
+    if IS_LINUX:
+        return "sha256_linux"
+    if IS_MAC:
+        return "sha256_macos"
+    return "sha256"
 
 
 # ============================================================
@@ -415,6 +443,7 @@ def _enum_titles_windows() -> List[str]:
         pass
     return titles
 
+
 def _enum_titles_linux() -> List[str]:
     try:
         out = subprocess.check_output(["wmctrl", "-l"], timeout=2,
@@ -422,6 +451,7 @@ def _enum_titles_linux() -> List[str]:
         return [line.split(None, 3)[-1].strip() for line in out.strip().splitlines()]
     except Exception:
         return []
+
 
 def enum_window_titles() -> List[str]:
     if IS_WINDOWS:
@@ -445,6 +475,7 @@ def hide_taskbar() -> None:
                 ctypes.windll.user32.ShowWindow(hwnd2, 0)
         except Exception:
             pass
+
 
 def show_taskbar() -> None:
     if IS_WINDOWS:
@@ -497,9 +528,8 @@ def _get_window_rect(hwnd: int) -> Optional[Tuple[int, int, int, int]]:
 
 def resize_external_window(pid: int, x: int, y: int, w: int, h: int) -> None:
     """
-    Ubah ukuran window browser. PENTING: hanya panggil SetWindowPos bila
-    geometri benar-benar berbeda. Panggilan berulang tanpa perubahan
-    mengganggu state fokus input teks di Chrome/Edge.
+    Ubah ukuran window browser. Hanya panggil SetWindowPos bila geometri
+    benar-benar berbeda — panggilan berulang mengganggu fokus input teks.
     """
     if IS_WINDOWS:
         hwnd = find_window_by_pid_windows(pid)
@@ -514,7 +544,6 @@ def resize_external_window(pid: int, x: int, y: int, w: int, h: int) -> None:
                     return  # sudah benar, JANGAN sentuh
             SWP_NOACTIVATE = 0x0010
             SWP_NOZORDER   = 0x0004
-            # hWndInsertAfter = 0 (diabaikan karena SWP_NOZORDER)
             user32.SetWindowPos(hwnd, 0, x, y, w, h,
                                 SWP_NOACTIVATE | SWP_NOZORDER)
             return
@@ -678,7 +707,7 @@ def find_browser() -> Tuple[str, str, str, str]:
 
 
 # ============================================================
-# UPDATE
+# HTTP HELPERS
 # ============================================================
 def http_get_text(url: str, timeout: int = 15) -> str:
     if HAS_REQUESTS:
@@ -690,6 +719,7 @@ def http_get_text(url: str, timeout: int = 15) -> str:
                                  headers={"User-Agent": f"CakBroUpdater/{APP_VERSION}"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode("utf-8", errors="replace")
+
 
 def http_download(url: str, dest: Path, timeout: int = 90) -> None:
     dest.parent.mkdir(parents=True, exist_ok=True)
@@ -707,12 +737,14 @@ def http_download(url: str, dest: Path, timeout: int = 90) -> None:
     with urllib.request.urlopen(req, timeout=timeout) as r, open(dest, "wb") as f:
         shutil.copyfileobj(r, f)
 
+
 def sha256_file(path: Path) -> str:
     h = hashlib.sha256()
     with open(path, "rb") as f:
         for chunk in iter(lambda: f.read(1 << 20), b""):
             h.update(chunk)
     return h.hexdigest()
+
 
 def is_newer(remote: str, current: str) -> bool:
     try:
@@ -721,14 +753,19 @@ def is_newer(remote: str, current: str) -> bool:
         return False
 
 
+# ============================================================
+# AUTO-UPDATE (cross-platform: Windows / Linux / macOS)
+# ============================================================
 def check_for_update_and_apply() -> bool:
     log_update("----- Pemeriksaan update dimulai -----")
-    log_update(f"Versi lokal={APP_VERSION}; frozen={getattr(sys, 'frozen', False)}")
+    log_update(f"Versi lokal={APP_VERSION}; OS={PLATFORM}; "
+               f"frozen={getattr(sys, 'frozen', False)}")
 
     if not getattr(sys, "frozen", False):
         log_update("Lewati update: interpreter, bukan EXE.")
         return False
 
+    # ---- Ambil manifest ----
     try:
         manifest = http_get_text(UPDATE_MANIFEST_URL)
     except Exception as e:
@@ -736,6 +773,7 @@ def check_for_update_and_apply() -> bool:
         return False
     manifest = manifest.lstrip("\ufeff")
 
+    # ---- Parse version ----
     m = re.search(r"(?im)^\s*version\s*=\s*(\d+\.\d+\.\d+)\s*$", manifest)
     if not m:
         log_update("Manifest: Version tidak ditemukan.")
@@ -746,33 +784,46 @@ def check_for_update_and_apply() -> bool:
         log_update("Tidak ada versi lebih baru.")
         return False
 
-    m = re.search(r"(?im)^\s*sha256\s*=\s*([A-Fa-f0-9]{64})\s*$", manifest)
+    # ---- Parse SHA-256 sesuai OS ----
+    hash_key = platform_hash_key()
+    m = re.search(rf"(?im)^\s*{hash_key}\s*=\s*([A-Fa-f0-9]{{64}})\s*$", manifest)
     if not m:
-        log_update("Manifest: SHA-256 tidak valid.")
-        return False
+        # Fallback ke "sha256 = ..." (single-platform / backward compat)
+        m = re.search(r"(?im)^\s*sha256\s*=\s*([A-Fa-f0-9]{64})\s*$", manifest)
+        if not m:
+            log_update(f"Manifest tidak memiliki {hash_key} maupun sha256.")
+            return False
+        log_update(f"Fallback ke sha256 generik (tidak ada {hash_key}).")
     expected = m.group(1).lower()
 
+    # ---- Siapkan folder ----
     udir = data_dir() / "Update"
     bdir = data_dir() / "Backup"
     udir.mkdir(parents=True, exist_ok=True)
     bdir.mkdir(parents=True, exist_ok=True)
 
-    staged = udir / f"CakBro-{remote}.download"
+    # ---- Tentukan nama aset sesuai OS ----
+    asset_name = platform_asset_name()
+    staged = udir / f"{asset_name}.{remote}.download"
     staged.unlink(missing_ok=True)
 
-    versioned = f"{UPDATE_RELEASE_BASE}{remote}/CakBro.exe"
-    log_update(f"Mengunduh: {versioned}")
+    versioned_url = f"{UPDATE_RELEASE_BASE}{remote}/{asset_name}"
+    latest_url    = f"{UPDATE_LATEST_BASE}/{asset_name}"
+
+    log_info(f"Aset untuk {PLATFORM}: {asset_name}")
+    log_update(f"Mengunduh: {versioned_url}")
     try:
-        http_download(versioned, staged)
+        http_download(versioned_url, staged)
     except Exception as e:
-        log_update(f"Gagal URL versi: {e}; coba latest.")
+        log_update(f"Gagal URL versi: {e}; coba URL latest.")
         staged.unlink(missing_ok=True)
         try:
-            http_download(UPDATE_BINARY_URL, staged)
+            http_download(latest_url, staged)
         except Exception as e2:
             log_update(f"Gagal URL latest: {e2}")
             return False
 
+    # ---- Verifikasi SHA-256 ----
     log_update(f"Unduhan selesai; size={staged.stat().st_size}")
     actual = sha256_file(staged)
     if actual != expected:
@@ -781,9 +832,12 @@ def check_for_update_and_apply() -> bool:
         return False
     log_update("SHA-256 cocok.")
 
+    # ---- Nama target + backup sesuai platform ----
     target = Path(sys.executable).resolve()
-    backup = bdir / (target.stem + ".previous.exe")
+    backup_ext = ".previous.exe" if IS_WINDOWS else ".previous"
+    backup = bdir / (target.stem + backup_ext)
 
+    # ---- Handoff ke helper updater ----
     if IS_WINDOWS:
         return _spawn_update_helper_windows(target, staged, backup)
     return _spawn_update_helper_unix(target, staged, backup)
@@ -1087,8 +1141,7 @@ class CakBroApp:
         profile.mkdir(parents=True, exist_ok=True)
         self._write_chromium_prefs(profile)
 
-        cmd = [self.browser_path,
-               "--kiosk", self.exam_url]
+        cmd = [self.browser_path, "--kiosk", self.exam_url]
         if self.browser_type == "edge":
             cmd += ["--edge-kiosk-type=fullscreen"]
         cmd += [
@@ -1142,7 +1195,6 @@ class CakBroApp:
     def _setup_browser_window(self):
         if not self.browser_proc:
             return
-        # Panggilan pertama: posisikan & resize.
         resize_external_window(self.browser_proc.pid, 0, 0, self.mon_w, self.browser_h)
 
     # ---------------- splash ----------------
@@ -1240,23 +1292,13 @@ class CakBroApp:
         self.root.after(1000, self.update_clock)
 
     def keep_focus(self):
-        """
-        PENTING:
-        - JANGAN panggil lift()/attributes() pada bar setiap tick.
-        - JANGAN resize window kalau geometrinya sudah benar.
-        - Untuk overlay warning/expired, re-lift hanya kalau ada.
-        Tujuan: tidak mengganggu fokus input teks di browser.
-        """
         if self.is_exiting or self.is_home_resetting:
             self.root.after(KEEP_FOCUS_MS, self.keep_focus)
             return
 
-        # Pastikan browser berada di geometri yang benar.
-        # resize_external_window() sudah cek dulu; kalau sama -> tidak lakukan apa-apa.
         if self.browser_proc and self.browser_proc.poll() is None:
             resize_external_window(self.browser_proc.pid, 0, 0, self.mon_w, self.browser_h)
 
-        # Overlay warning/expired memang harus selalu di atas browser.
         if self.expired_win and self.expired_win.winfo_exists():
             try:
                 self.expired_win.attributes("-topmost", True)
@@ -1269,10 +1311,6 @@ class CakBroApp:
                 self.warning_win.lift()
             except Exception:
                 pass
-
-        # CATATAN: bar TIDAK di-lift tiap tick. Bar dan browser tidak overlap
-        # (browser tinggi = screen_h - BAR_HEIGHT, bar di bawahnya), sehingga
-        # bar tidak perlu diangkat ulang.
 
         self.root.after(KEEP_FOCUS_MS, self.keep_focus)
 
