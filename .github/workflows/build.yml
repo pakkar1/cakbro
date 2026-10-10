@@ -1,0 +1,61 @@
+name: Build CakBro
+
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+
+jobs:
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: windows-latest
+            artifact: CakBro-windows.exe
+            sep: ';'
+          - os: ubuntu-22.04
+            artifact: CakBro-linux
+            sep: ':'
+          - os: macos-latest
+            artifact: CakBro-macos
+            sep: ':'
+
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+
+      - name: Install deps
+        run: |
+          python -m pip install --upgrade pip
+          pip install -r requirements.txt pyinstaller
+        shell: bash
+
+      - name: Build (Windows)
+        if: runner.os == 'Windows'
+        run: pyinstaller --clean --noconfirm cakbro.spec
+
+      - name: Build (Linux/macOS)
+        if: runner.os != 'Windows'
+        run: |
+          pyinstaller --clean --noconfirm cakbro.spec
+          # Rename output
+          if [ -f dist/CakBro ]; then mv dist/CakBro "dist/${{ matrix.artifact }}"; fi
+        shell: bash
+
+      - name: Rename (Windows)
+        if: runner.os == 'Windows'
+        run: |
+          move dist\CakBro.exe dist\${{ matrix.artifact }}
+        shell: cmd
+
+      - name: Upload artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.artifact }}
+          path: dist/${{ matrix.artifact }}
