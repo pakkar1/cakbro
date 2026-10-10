@@ -1,20 +1,9 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-CakBro 2.10.4 - Safe Exam Browser (Python cross-platform port)
-Portable & Lightweight Kiosk Browser - Auto: Edge / Chrome / Brave / Firefox
-
-Fitur:
-  - Kiosk fullscreen tanpa UI browser (prioritas: Edge > Chrome > Brave > Firefox)
-  - Blokir 60+ shortcut berbahaya
-  - Blokir translate popup & notifikasi
-  - Sembunyikan taskbar (Windows)
-  - Tutup aplikasi terlarang otomatis
-  - Auto-restart browser bila ditutup paksa
-  - Home confirmation: tutup tab, hapus profil/cookie kiosk
-  - Expiry: overlay semi-transparan; 5 detik tanpa klik -> Home otomatis
-  - GitHub update check + SHA-256 + helper handoff + log
-  - Keluar: CTRL+ALT+SHIFT+Q
+CakBro 2.10.4 — Safe Exam Browser (Python cross-platform port)
+AV-SAFE VERSION: pakai Win32 RegisterHotKey (bukan library `keyboard`)
+                 tanpa suppress mouse, sehingga antivirus tidak false-positive.
 """
 
 from __future__ import annotations
@@ -34,12 +23,12 @@ import threading
 import time
 import urllib.request
 from pathlib import Path
-from typing import List, Optional, Tuple
+from typing import Callable, Dict, List, Optional, Tuple
 
 import tkinter as tk
 from tkinter import messagebox
 
-# ---------- optional deps ----------
+# ---------- optional deps (hanya untuk non-Windows) ----------
 try:
     import psutil
     HAS_PSUTIL = True
@@ -52,21 +41,21 @@ try:
 except ImportError:
     HAS_REQUESTS = False
 
-try:
-    import keyboard as kb_lib
-    HAS_KB = True
-except Exception:
+# `keyboard` HANYA dipakai sebagai fallback di Linux/macOS.
+# Di Windows kita pakai Win32 RegisterHotKey (tanpa dependency ini).
+if platform.system() != "Windows":
+    try:
+        import keyboard as kb_lib
+        HAS_KB = True
+    except Exception:
+        HAS_KB = False
+else:
+    kb_lib = None
     HAS_KB = False
-
-try:
-    from pynput import mouse as pyn_mouse
-    HAS_PYNPUT_MOUSE = True
-except Exception:
-    HAS_PYNPUT_MOUSE = False
 
 
 # ============================================================
-# CONFIG (standalone - hardcoded)
+# CONFIG
 # ============================================================
 APP_NAME             = "CakBro"
 APP_VERSION          = "2.10.4"
@@ -75,7 +64,7 @@ UPDATE_MANIFEST_URL  = "https://raw.githubusercontent.com/pakkar1/cakbro-updates
 UPDATE_BINARY_URL    = "https://github.com/pakkar1/cakbro-updates/releases/latest/download/CakBro.exe"
 UPDATE_RELEASE_BASE  = "https://github.com/pakkar1/cakbro-updates/releases/download/v"
 
-PLATFORM   = platform.system()  # 'Windows' | 'Linux' | 'Darwin'
+PLATFORM   = platform.system()
 IS_WINDOWS = PLATFORM == "Windows"
 IS_LINUX   = PLATFORM == "Linux"
 IS_MAC     = PLATFORM == "Darwin"
@@ -86,6 +75,10 @@ BAR_TEXT_COLOR  = "#00d4ff"
 ACCENT_COLOR    = "#00d4ff"
 
 BRIDGE_MARKER   = "|CAKBRO_AHK|"
+
+EXIT_HOTKEY     = "ctrl+alt+shift+q"
+POLL_EXIT_MS    = 250
+
 
 # ============================================================
 # APP DIR / DATA DIR
@@ -116,9 +109,278 @@ def log_update(msg: str) -> None:
     except Exception:
         pass
 
+def log_info(msg: str) -> None:
+    print(f"[CakBro] {msg}", flush=True)
+    log_update(msg)
+
 
 # ============================================================
-# WINDOW TITLE ENUMERATION (untuk bridge)
+# WINDOWS NATIVE HOTKEY MANAGER (via RegisterHotKey)
+# ============================================================
+if IS_WINDOWS:
+    import ctypes.wintypes as wt
+
+    user32   = ctypes.WinDLL("user32",   use_last_error=True)
+    kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+
+    class MSG(ctypes.Structure):
+        _fields_ = [
+            ("hwnd",    wt.HWND),
+            ("message", wt.UINT),
+            ("wParam",  wt.WPARAM),
+            ("lParam",  wt.LPARAM),
+            ("time",    wt.DWORD),
+            ("pt",      wt.POINT),
+        ]
+
+    user32.RegisterHotKey.argtypes      = [wt.HWND, ctypes.c_int, wt.UINT, wt.UINT]
+    user32.RegisterHotKey.restype       = wt.BOOL
+    user32.UnregisterHotKey.argtypes    = [wt.HWND, ctypes.c_int]
+    user32.UnregisterHotKey.restype     = wt.BOOL
+    user32.GetMessageW.argtypes         = [ctypes.POINTER(MSG), wt.HWND, wt.UINT, wt.UINT]
+    user32.GetMessageW.restype          = ctypes.c_int
+    user32.PostThreadMessageW.argtypes  = [wt.DWORD, wt.UINT, wt.WPARAM, wt.LPARAM]
+    kernel32.GetCurrentThreadId.restype = wt.DWORD
+
+    WM_HOTKEY    = 0x0312
+    WM_QUIT_     = 0x0012
+    MOD_ALT      = 0x0001
+    MOD_CONTROL  = 0x0002
+    MOD_SHIFT    = 0x0004
+    MOD_WIN      = 0x0008
+    MOD_NOREPEAT = 0x4000
+
+
+class WindowsHotkeyManager:
+    """
+    Manajemen hotkey native Windows via RegisterHotKey.
+    - Tidak memakai low-level hook -> antivirus tidak mendeteksi keylogger.
+    - Callback dijalankan di thread message loop internal.
+    """
+    def __init__(self):
+        self.hotkeys: Dict[int, Tuple[int, int, Callable]] = {}
+        self.next_id = 1
+        self._thread: Optional[threading.Thread] = None
+        self._thread_id = 0
+        self._running = False
+        self._lock = threading.Lock()
+
+    def register(self, mods: int, vk: int, callback: Callable) -> bool:
+        with self._lock:
+            hid = self.next_id
+            self.next_id += 1
+        # Coba dengan MOD_NOREPEAT, fallback tanpa MOD_NOREPEAT
+        ok = user32.RegisterHotKey(None, hid, mods | MOD_NOREPEAT, vk)
+        if not ok:
+            ok = user32.RegisterHotKey(None, hid, mods, vk)
+        if not ok:
+            return False
+        self.hotkeys[hid] = (mods, vk, callback)
+        return True
+
+    def start(self) -> None:
+        if self._thread is not None:
+            return
+        self._running = True
+        self._thread = threading.Thread(target=self._loop, daemon=True,
+                                        name="CakBroHotkeyLoop")
+        self._thread.start()
+
+    def _loop(self) -> None:
+        self._thread_id = kernel32.GetCurrentThreadId()
+        msg = MSG()
+        while self._running:
+            ret = user32.GetMessageW(ctypes.byref(msg), None, 0, 0)
+            if ret in (0, -1):
+                break
+            if msg.message == WM_HOTKEY:
+                entry = self.hotkeys.get(int(msg.wParam))
+                if entry:
+                    _mods, _vk, cb = entry
+                    try:
+                        cb()
+                    except Exception as e:
+                        log_update(f"hotkey callback error: {e}")
+
+    def unregister_all(self) -> None:
+        for hid in list(self.hotkeys.keys()):
+            try:
+                user32.UnregisterHotKey(None, hid)
+            except Exception:
+                pass
+        self.hotkeys.clear()
+
+    def stop(self) -> None:
+        self._running = False
+        if self._thread_id:
+            try:
+                user32.PostThreadMessageW(self._thread_id, WM_QUIT_, 0, 0)
+            except Exception:
+                pass
+        self.unregister_all()
+
+
+# ============================================================
+# VK CODES + BLOCK LIST (Windows)
+# ============================================================
+VK = {
+    # letters
+    **{c: ord(c.upper()) for c in "abcdefghijklmnopqrstuvwxyz"},
+    # digits
+    **{str(d): 0x30 + d for d in range(10)},
+    # special
+    "tab": 0x09, "escape": 0x1B, "space": 0x20, "enter": 0x0D,
+    "delete": 0x2E, "insert": 0x2D, "backspace": 0x08,
+    "print": 0x2C, "apps": 0x5D,
+    ".": 0xBE, ";": 0xBA,
+    # function keys
+    **{f"f{i}": 0x6F + i for i in range(1, 13)},
+    # windows keys
+    "lwin": 0x5B, "rwin": 0x5C,
+}
+
+# Format: (mods, key)
+# CATATAN: key tanpa mod (mods=0) hanya untuk tombol khusus (F-keys, PrintScreen),
+#          JANGAN untuk huruf/angka karena akan memblokir pengetikan.
+BLOCK_HOTKEYS_WIN = [
+    # ---------- Win + X ----------
+    (MOD_WIN, "r"), (MOD_WIN, "e"), (MOD_WIN, "d"), (MOD_WIN, "l"),
+    (MOD_WIN, "x"), (MOD_WIN, "s"), (MOD_WIN, "q"), (MOD_WIN, "i"),
+    (MOD_WIN, "a"), (MOD_WIN, "tab"), (MOD_WIN, "m"), (MOD_WIN, "b"),
+    (MOD_WIN, "p"), (MOD_WIN, "k"), (MOD_WIN, "g"), (MOD_WIN, "h"),
+    (MOD_WIN, "u"), (MOD_WIN, "v"), (MOD_WIN, "w"), (MOD_WIN, "."),
+    (MOD_WIN, ";"), (MOD_WIN, "c"), (MOD_WIN, "space"),
+    (MOD_WIN | MOD_SHIFT, "s"), (MOD_WIN | MOD_SHIFT, "m"),
+    (MOD_WIN, "1"), (MOD_WIN, "2"), (MOD_WIN, "3"), (MOD_WIN, "4"),
+    (MOD_WIN, "5"), (MOD_WIN, "6"), (MOD_WIN, "7"), (MOD_WIN, "8"),
+    (MOD_WIN, "9"), (MOD_WIN, "0"),
+    # ---------- Alt + X ----------
+    (MOD_ALT, "tab"), (MOD_ALT, "f4"), (MOD_ALT, "escape"), (MOD_ALT, "space"),
+    # ---------- Ctrl + X ----------
+    (MOD_CONTROL, "escape"), (MOD_CONTROL | MOD_SHIFT, "escape"),
+    (MOD_CONTROL | MOD_ALT, "delete"),
+    # ---------- Browser shortcuts ----------
+    (MOD_CONTROL, "t"), (MOD_CONTROL, "n"), (MOD_CONTROL, "w"),
+    (MOD_CONTROL, "l"), (MOD_CONTROL, "d"), (MOD_CONTROL, "h"),
+    (MOD_CONTROL, "j"), (MOD_CONTROL, "u"), (MOD_CONTROL, "p"),
+    (MOD_CONTROL, "o"), (MOD_CONTROL, "s"), (MOD_CONTROL, "g"),
+    (MOD_CONTROL, "k"), (MOD_CONTROL, "e"),
+    (MOD_CONTROL, "tab"), (MOD_CONTROL | MOD_SHIFT, "tab"),
+    (MOD_CONTROL | MOD_SHIFT, "n"), (MOD_CONTROL | MOD_SHIFT, "w"),
+    (MOD_CONTROL | MOD_SHIFT, "i"), (MOD_CONTROL | MOD_SHIFT, "j"),
+    (MOD_CONTROL | MOD_SHIFT, "c"), (MOD_CONTROL | MOD_SHIFT, "t"),
+    # ---------- F-keys (unmodified) ----------
+    (0, "f1"), (0, "f3"), (0, "f6"), (0, "f7"), (0, "f10"),
+    (0, "f11"), (0, "f12"),
+    # ---------- Print Screen ----------
+    (0, "print"),
+    (MOD_ALT, "print"), (MOD_CONTROL, "print"),
+    # ---------- Misc ----------
+    (0, "apps"),
+    (MOD_CONTROL | MOD_ALT, "a"), (MOD_CONTROL | MOD_ALT, "s"),
+]
+
+
+# ============================================================
+# HOTKEY SETUP (multi-platform)
+# ============================================================
+# Callback global untuk exit
+_exit_hotkey_cb: Optional[Callable] = None
+_win_hotkey_mgr: Optional[WindowsHotkeyManager] = None
+
+
+def _dispatch_exit_hotkey():
+    cb = _exit_hotkey_cb
+    if cb:
+        try:
+            cb()
+        except Exception as e:
+            log_update(f"exit hotkey callback error: {e}")
+
+
+def _vk_to_name(key: str) -> str:
+    return key
+
+
+def setup_hotkey_windows() -> Optional[WindowsHotkeyManager]:
+    """Windows: pakai RegisterHotKey native (AV-safe)."""
+    mgr = WindowsHotkeyManager()
+
+    # Exit hotkey: Ctrl + Alt + Shift + Q
+    exit_ok = mgr.register(MOD_CONTROL | MOD_ALT | MOD_SHIFT, VK["q"],
+                           _dispatch_exit_hotkey)
+    if exit_ok:
+        log_info("Hotkey exit terdaftar (Win32): Ctrl+Alt+Shift+Q")
+        print("[INFO] Hotkey exit aktif: CTRL+ALT+SHIFT+Q")
+    else:
+        log_info("GAGAL mendaftarkan hotkey exit via RegisterHotKey!")
+        print("[WARN] Hotkey exit tidak bisa didaftarkan. Coba jalankan sebagai Admin.")
+
+    # Blocker
+    ok = 0
+    fail = 0
+    for mods, key in BLOCK_HOTKEYS_WIN:
+        vk = VK.get(key)
+        if vk is None:
+            fail += 1
+            continue
+        if mgr.register(mods, vk, lambda: None):
+            ok += 1
+        else:
+            fail += 1
+
+    log_info(f"Blocker Win32 aktif: ok={ok} fail={fail}")
+    print(f"[INFO] Hotkey blocker aktif: ok={ok} fail={fail}")
+
+    mgr.start()
+    return mgr
+
+
+def setup_hotkey_fallback() -> Optional[object]:
+    """Linux/macOS fallback: pakai library keyboard (butuh root/Accessibility)."""
+    if not HAS_KB:
+        log_info("Fallback 'keyboard' tidak terpasang. Hotkey blocker nonaktif.")
+        return None
+    try:
+        kb_lib.add_hotkey(EXIT_HOTKEY, _dispatch_exit_hotkey,
+                          suppress=False, trigger_on_release=False)
+        log_info(f"Hotkey exit (fallback) aktif: {EXIT_HOTKEY}")
+        ok = 0
+        fail = 0
+        # Blocker terbatas (fallback tidak sekuat Win32)
+        for mods, key in [
+            (2, "escape"), (3, "escape"),  # ctrl+esc, ctrl+shift+esc
+            (1, "tab"), (1, "f4"), (1, "escape"),
+            (2, "t"), (2, "n"), (2, "w"), (2, "l"), (2, "j"), (2, "u"),
+            (2, "p"), (2, "s"), (2, "o"),
+            (2, "tab"), (2 | 4, "tab"),
+            (0, "f11"), (0, "f12"),
+        ]:
+            try:
+                kb_lib.add_hotkey(f"{'ctrl+' if mods & 2 else ''}"
+                                  f"{'alt+' if mods & 1 else ''}"
+                                  f"{'shift+' if mods & 4 else ''}{key}",
+                                  lambda: None, suppress=True)
+                ok += 1
+            except Exception:
+                fail += 1
+        log_info(f"Blocker fallback: ok={ok} fail={fail}")
+        return kb_lib
+    except Exception as e:
+        log_info(f"Fallback hotkey gagal: {e}")
+        return None
+
+
+def setup_hotkeys():
+    global _win_hotkey_mgr
+    if IS_WINDOWS:
+        _win_hotkey_mgr = setup_hotkey_windows()
+        return _win_hotkey_mgr
+    return setup_hotkey_fallback()
+
+
+# ============================================================
+# WINDOW TITLE ENUMERATION
 # ============================================================
 def _enum_titles_windows() -> List[str]:
     titles: List[str] = []
@@ -145,32 +407,30 @@ def _enum_titles_windows() -> List[str]:
     return titles
 
 def _enum_titles_linux() -> List[str]:
-    for tool, args in (("wmctrl", ["wmctrl", "-l"]), ("xdotool", ["xdotool", "search", "--name", ""])):
-        try:
-            out = subprocess.check_output(args, timeout=2, text=True, stderr=subprocess.DEVNULL)
-            if tool == "wmctrl":
-                return [line.split(None, 3)[-1].strip() for line in out.strip().splitlines()]
-        except Exception:
-            continue
-    return []
+    try:
+        out = subprocess.check_output(["wmctrl", "-l"], timeout=2,
+                                      text=True, stderr=subprocess.DEVNULL)
+        return [line.split(None, 3)[-1].strip() for line in out.strip().splitlines()]
+    except Exception:
+        return []
 
 def enum_window_titles() -> List[str]:
     if IS_WINDOWS:
         return _enum_titles_windows()
     if IS_LINUX:
         return _enum_titles_linux()
-    return []  # macOS: stub (butuh PyObjC; dapat ditambah bila perlu)
+    return []
 
 
 # ============================================================
-# FENSTER control per platform
+# TASKBAR + WINDOW HELPERS
 # ============================================================
 def hide_taskbar() -> None:
     if IS_WINDOWS:
         try:
             hwnd = ctypes.windll.user32.FindWindowW("Shell_TrayWnd", None)
             if hwnd:
-                ctypes.windll.user32.ShowWindow(hwnd, 0)  # SW_HIDE
+                ctypes.windll.user32.ShowWindow(hwnd, 0)
             hwnd2 = ctypes.windll.user32.FindWindowW("Shell_SecondaryTrayWnd", None)
             if hwnd2:
                 ctypes.windll.user32.ShowWindow(hwnd2, 0)
@@ -182,7 +442,7 @@ def show_taskbar() -> None:
         try:
             hwnd = ctypes.windll.user32.FindWindowW("Shell_TrayWnd", None)
             if hwnd:
-                ctypes.windll.user32.ShowWindow(hwnd, 5)  # SW_SHOW
+                ctypes.windll.user32.ShowWindow(hwnd, 5)
             hwnd2 = ctypes.windll.user32.FindWindowW("Shell_SecondaryTrayWnd", None)
             if hwnd2:
                 ctypes.windll.user32.ShowWindow(hwnd2, 5)
@@ -226,17 +486,12 @@ def resize_external_window(pid: int, x: int, y: int, w: int, h: int) -> None:
             return
     if IS_LINUX:
         try:
-            subprocess.run(["xdotool", "search", "--pid", str(pid), "windowsize", str(w), str(h),
+            subprocess.run(["xdotool", "search", "--pid", str(pid),
+                            "windowsize", str(w), str(h),
                             "windowmove", str(x), str(y)],
                            timeout=2, check=False, stderr=subprocess.DEVNULL)
         except Exception:
             pass
-
-def maximize_external_window(pid: int) -> None:
-    if IS_WINDOWS:
-        hwnd = find_window_by_pid_windows(pid)
-        if hwnd:
-            ctypes.windll.user32.ShowWindow(hwnd, 3)  # SW_MAXIMIZE
 
 
 def kill_process_tree(pid: int) -> None:
@@ -244,7 +499,8 @@ def kill_process_tree(pid: int) -> None:
         try:
             if IS_WINDOWS:
                 subprocess.run(["taskkill", "/F", "/PID", str(pid), "/T"],
-                               check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                               check=False, stdout=subprocess.DEVNULL,
+                               stderr=subprocess.DEVNULL)
             else:
                 os.kill(pid, signal.SIGKILL)
         except Exception:
@@ -253,10 +509,14 @@ def kill_process_tree(pid: int) -> None:
     try:
         parent = psutil.Process(pid)
         for child in parent.children(recursive=True):
-            try: child.kill()
-            except Exception: pass
-        try: parent.kill()
-        except Exception: pass
+            try:
+                child.kill()
+            except Exception:
+                pass
+        try:
+            parent.kill()
+        except Exception:
+            pass
     except Exception:
         pass
 
@@ -270,7 +530,8 @@ def taskkill_names(names: List[str]) -> None:
             for n in names:
                 args += ["/IM", n]
             args.append("/T")
-            subprocess.run(args, check=False, stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            subprocess.run(args, check=False,
+                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
         return
     lowered = {n.lower() for n in names}
     for proc in psutil.process_iter(["pid", "name"]):
@@ -282,8 +543,17 @@ def taskkill_names(names: List[str]) -> None:
             pass
 
 
+def _is_admin_windows() -> bool:
+    if not IS_WINDOWS:
+        return False
+    try:
+        return bool(ctypes.windll.shell32.IsUserAnAdmin())
+    except Exception:
+        return False
+
+
 # ============================================================
-# BROWSER FINDER (prioritas: Edge > Chrome > Brave > Firefox)
+# BROWSER FINDER
 # ============================================================
 def _win_reg_app_paths(exe: str) -> Optional[str]:
     if not IS_WINDOWS:
@@ -292,10 +562,13 @@ def _win_reg_app_paths(exe: str) -> Optional[str]:
         import winreg
     except ImportError:
         return None
-    for hive, access in ((winreg.HKEY_LOCAL_MACHINE, winreg.KEY_READ | winreg.KEY_WOW64_64KEY),
-                         (winreg.HKEY_LOCAL_MACHINE, winreg.KEY_READ | winreg.KEY_WOW64_32KEY)):
+    for hive, access in ((winreg.HKEY_LOCAL_MACHINE,
+                          winreg.KEY_READ | winreg.KEY_WOW64_64KEY),
+                         (winreg.HKEY_LOCAL_MACHINE,
+                          winreg.KEY_READ | winreg.KEY_WOW64_32KEY)):
         try:
-            with winreg.OpenKey(hive, r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\\" + exe,
+            with winreg.OpenKey(hive,
+                                r"SOFTWARE\Microsoft\Windows\CurrentVersion\App Paths\\" + exe,
                                 0, access) as k:
                 val, _ = winreg.QueryValueEx(k, None)
                 val = val.strip('"')
@@ -307,7 +580,6 @@ def _win_reg_app_paths(exe: str) -> Optional[str]:
 
 
 def find_browser() -> Tuple[str, str, str, str]:
-    """Return (path, type, name, exe). type in {'edge','chromium','firefox'}"""
     home = Path.home()
     local = Path(os.environ.get("LOCALAPPDATA", "")) if IS_WINDOWS else home
 
@@ -355,7 +627,6 @@ def find_browser() -> Tuple[str, str, str, str]:
         if regpath:
             return regpath, btype, name, exe
 
-    # PATH fallback
     for exe in ("msedge.exe", "chrome.exe", "brave.exe", "firefox.exe"):
         try:
             which = shutil.which(exe)
@@ -373,14 +644,16 @@ def find_browser() -> Tuple[str, str, str, str]:
 
 
 # ============================================================
-# UPDATE (SHA-256 + manifest)
+# UPDATE
 # ============================================================
 def http_get_text(url: str, timeout: int = 15) -> str:
     if HAS_REQUESTS:
-        r = requests.get(url, timeout=timeout, headers={"User-Agent": f"CakBroUpdater/{APP_VERSION}"})
+        r = requests.get(url, timeout=timeout,
+                         headers={"User-Agent": f"CakBroUpdater/{APP_VERSION}"})
         r.raise_for_status()
         return r.text
-    req = urllib.request.Request(url, headers={"User-Agent": f"CakBroUpdater/{APP_VERSION}"})
+    req = urllib.request.Request(url,
+                                 headers={"User-Agent": f"CakBroUpdater/{APP_VERSION}"})
     with urllib.request.urlopen(req, timeout=timeout) as r:
         return r.read().decode("utf-8", errors="replace")
 
@@ -395,7 +668,8 @@ def http_download(url: str, dest: Path, timeout: int = 90) -> None:
                     if chunk:
                         f.write(chunk)
         return
-    req = urllib.request.Request(url, headers={"User-Agent": f"CakBroUpdater/{APP_VERSION}"})
+    req = urllib.request.Request(url,
+                                 headers={"User-Agent": f"CakBroUpdater/{APP_VERSION}"})
     with urllib.request.urlopen(req, timeout=timeout) as r, open(dest, "wb") as f:
         shutil.copyfileobj(r, f)
 
@@ -408,23 +682,17 @@ def sha256_file(path: Path) -> str:
 
 def is_newer(remote: str, current: str) -> bool:
     try:
-        r = [int(x) for x in remote.split(".")]
-        c = [int(x) for x in current.split(".")]
-        return r > c
+        return [int(x) for x in remote.split(".")] > [int(x) for x in current.split(".")]
     except Exception:
         return False
 
 
 def check_for_update_and_apply() -> bool:
-    """
-    Return True bila update akan diterapkan (caller harus ExitApp).
-    Return False bila lanjut normal.
-    """
     log_update("----- Pemeriksaan update dimulai -----")
     log_update(f"Versi lokal={APP_VERSION}; frozen={getattr(sys, 'frozen', False)}")
 
     if not getattr(sys, "frozen", False):
-        log_update("Lewati update: script berjalan dari interpreter, bukan EXE terkompilasi.")
+        log_update("Lewati update: interpreter, bukan EXE.")
         return False
 
     try:
@@ -436,7 +704,7 @@ def check_for_update_and_apply() -> bool:
 
     m = re.search(r"(?im)^\s*version\s*=\s*(\d+\.\d+\.\d+)\s*$", manifest)
     if not m:
-        log_update("Manifest: baris Version tidak ditemukan.")
+        log_update("Manifest: Version tidak ditemukan.")
         return False
     remote = m.group(1)
     log_update(f"Versi remote={remote}")
@@ -456,35 +724,32 @@ def check_for_update_and_apply() -> bool:
     bdir.mkdir(parents=True, exist_ok=True)
 
     staged = udir / f"CakBro-{remote}.download"
-    if staged.exists():
-        staged.unlink()
+    staged.unlink(missing_ok=True)
 
     versioned = f"{UPDATE_RELEASE_BASE}{remote}/CakBro.exe"
-    log_update(f"Mengunduh aset: {versioned}")
+    log_update(f"Mengunduh: {versioned}")
     try:
         http_download(versioned, staged)
     except Exception as e:
-        log_update(f"Unduhan URL versi gagal: {e}; coba URL latest.")
-        if staged.exists():
-            staged.unlink()
+        log_update(f"Gagal URL versi: {e}; coba latest.")
+        staged.unlink(missing_ok=True)
         try:
             http_download(UPDATE_BINARY_URL, staged)
         except Exception as e2:
-            log_update(f"Unduhan URL latest gagal: {e2}")
+            log_update(f"Gagal URL latest: {e2}")
             return False
 
-    log_update(f"Unduhan selesai; size={staged.stat().st_size} byte")
+    log_update(f"Unduhan selesai; size={staged.stat().st_size}")
     actual = sha256_file(staged)
     if actual != expected:
         log_update(f"SHA-256 mismatch. Manifest={expected} file={actual}")
         staged.unlink(missing_ok=True)
         return False
-    log_update("SHA-256 cocok; update terverifikasi.")
+    log_update("SHA-256 cocok.")
 
     target = Path(sys.executable).resolve()
     backup = bdir / (target.stem + ".previous.exe")
 
-    # tulis helper updater (PowerShell untuk Windows, sh untuk Unix)
     if IS_WINDOWS:
         return _spawn_update_helper_windows(target, staged, backup)
     return _spawn_update_helper_unix(target, staged, backup)
@@ -512,10 +777,10 @@ function Log($m) {{
 }}
 try {{
   [IO.File]::WriteAllText($ready, 'ready')
-  Log 'Helper started; waiting for parent exit.'
+  Log 'Helper started.'
   $deadline = (Get-Date).AddSeconds(90)
   while (Get-Process -Id $parentPid -ErrorAction SilentlyContinue) {{
-    if ((Get-Date) -ge $deadline) {{ throw 'Timeout waiting for parent.' }}
+    if ((Get-Date) -ge $deadline) {{ throw 'Timeout.' }}
     Start-Sleep -Milliseconds 500
   }}
   $parentExited = $true
@@ -524,7 +789,7 @@ try {{
   $backupMade = $true
   Copy-Item -LiteralPath $staged -Destination $pending -Force
   Move-Item -LiteralPath $pending -Destination $target -Force
-  Log 'New EXE installed; starting CakBro.'
+  Log 'Installed; restarting.'
   Start-Process -FilePath $target -WorkingDirectory (Split-Path $target -Parent)
   Remove-Item -LiteralPath $staged -Force -ErrorAction SilentlyContinue
 }} catch {{
@@ -547,25 +812,24 @@ try {{
         log_update(f"PowerShell tidak ditemukan: {pwsh}")
         return False
 
-    log_update("Meluncurkan PowerShell helper...")
+    log_update("Jalankan PowerShell helper...")
     try:
         subprocess.Popen([str(pwsh), "-NoProfile", "-NonInteractive",
                           "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden",
                           "-File", str(helper)],
                          cwd=str(udir),
-                         creationflags=subprocess.CREATE_NO_WINDOW if IS_WINDOWS else 0)
+                         creationflags=subprocess.CREATE_NO_WINDOW)
     except Exception as e:
-        log_update(f"Gagal menjalankan helper: {e}")
+        log_update(f"Gagal jalankan helper: {e}")
         return False
 
-    # tunggu ready
     for _ in range(60):
         if ready.exists():
             ready.unlink(missing_ok=True)
-            log_update("Helper ready; CakBro akan keluar untuk swap EXE.")
+            log_update("Helper siap; keluar untuk swap EXE.")
             return True
         time.sleep(0.25)
-    log_update("Helper tidak siap dalam 15 detik; update dibatalkan.")
+    log_update("Helper tidak siap dalam 15 detik.")
     return False
 
 
@@ -578,20 +842,15 @@ def _spawn_update_helper_unix(target: Path, staged: Path, backup: Path) -> bool:
 
     sh = f"""#!/bin/sh
 set -e
-TARGET="{target}"
-STAGED="{staged}"
-BACKUP="{backup}"
-READY="{ready}"
-LOG="{log_path}"
-PID={parent_pid}
+TARGET="{target}"; STAGED="{staged}"; BACKUP="{backup}"
+READY="{ready}"; LOG="{log_path}"; PID={parent_pid}
 PENDING="$TARGET.pending"
 log() {{ echo "$(date '+%Y-%m-%d %H:%M:%S') | $1" >> "$LOG"; }}
 echo ready > "$READY"
-log "Helper started; waiting for parent exit."
+log "Helper started."
 i=0
 while kill -0 "$PID" 2>/dev/null; do
-  i=$((i+1))
-  [ $i -gt 180 ] && {{ log "Timeout"; exit 1; }}
+  i=$((i+1)); [ $i -gt 180 ] && {{ log "Timeout"; exit 1; }}
   sleep 0.5
 done
 sleep 0.5
@@ -599,115 +858,25 @@ cp -f "$TARGET" "$BACKUP"
 cp -f "$STAGED" "$PENDING"
 mv -f "$PENDING" "$TARGET"
 chmod +x "$TARGET"
-log "New binary installed; starting CakBro."
+log "Installed; restart."
 nohup "$TARGET" >/dev/null 2>&1 &
 rm -f "$STAGED"
 """
     helper.write_text(sh, encoding="utf-8")
     helper.chmod(0o755)
     ready.unlink(missing_ok=True)
-
-    log_update("Meluncurkan shell helper...")
+    log_update("Jalankan shell helper...")
     try:
         subprocess.Popen(["/bin/sh", str(helper)], cwd=str(udir))
     except Exception as e:
-        log_update(f"Gagal menjalankan helper: {e}")
+        log_update(f"Gagal jalankan helper: {e}")
         return False
-
     for _ in range(60):
         if ready.exists():
             ready.unlink(missing_ok=True)
-            log_update("Helper ready; CakBro akan keluar untuk swap binary.")
             return True
         time.sleep(0.25)
-    log_update("Helper tidak siap dalam 15 detik; update dibatalkan.")
     return False
-
-
-# ============================================================
-# HOTKEY BLOCKER
-# ============================================================
-WINDOWS_HOTKEYS = [
-    "windows", "left windows", "right windows",
-    "windows+d", "windows+e", "windows+r", "windows+l", "windows+tab",
-    "windows+m", "windows+shift+m", "windows+b", "windows+i",
-    "windows+s", "windows+a", "windows+x", "windows+p", "windows+k",
-    "windows+g", "windows+h", "windows+u", "windows+v", "windows+w",
-    "windows+q", "windows+.", "windows+;", "windows+c",
-    "windows+shift+s",
-    "windows+1", "windows+2", "windows+3", "windows+4", "windows+5",
-    "windows+6", "windows+7", "windows+8", "windows+9", "windows+0",
-    "windows+space",
-    "alt+tab", "alt+f4", "alt+escape", "alt+space", "alt+f8",
-    "ctrl+escape", "ctrl+shift+escape", "ctrl+alt+delete",
-    # browser shortcuts
-    "ctrl+t", "ctrl+n", "ctrl+shift+n", "ctrl+w", "ctrl+shift+w",
-    "ctrl+l", "ctrl+d", "ctrl+h", "ctrl+j", "ctrl+shift+i", "ctrl+shift+j",
-    "ctrl+shift+c", "ctrl+u", "ctrl+p", "ctrl+o", "ctrl+s", "ctrl+g",
-    "ctrl+shift+delete", "ctrl+tab", "ctrl+shift+tab", "ctrl+f5",
-    "ctrl+shift+t", "ctrl+k", "ctrl+e",
-    # function keys
-    "f1", "f3", "f6", "f7", "f10", "f11", "f12",
-    # print screen
-    "print screen", "alt+print screen", "ctrl+print screen",
-    # misc
-    "apps", "ctrl+alt+a", "ctrl+alt+s",
-]
-
-
-def setup_hotkey_blocker() -> Optional[object]:
-    """
-    Return listener object (harus disimpan agar tidak di-GC) atau None.
-    Windows: pakai `keyboard` (tanpa admin).
-    Linux:   pakai `keyboard` (butuh root; akan fail gracefully).
-    macOS:   pakai `keyboard` (butuh Accessibility).
-    """
-    if not HAS_KB:
-        log_update("Modul 'keyboard' tidak tersedia; hotkey blocker dinonaktifkan.")
-        return None
-
-    try:
-        for hk in WINDOWS_HOTKEYS:
-            try:
-                kb_lib.add_hotkey(hk, lambda: None, suppress=True)
-            except Exception:
-                pass
-        # blokir tombol Windows penuh (kiri/kanan)
-        for key in ("windows", "left windows", "right windows"):
-            try: kb_lib.block_key(key)
-            except Exception: pass
-
-        # cek kombinasi keluar sendiri
-        kb_lib.add_hotkey("ctrl+alt+shift+q", _exit_hotkey_pressed, suppress=False)
-        log_update("Hotkey blocker aktif.")
-        return kb_lib
-    except Exception as e:
-        log_update(f"Hotkey blocker gagal: {e}")
-        return None
-
-
-def block_context_menu() -> Optional[object]:
-    """Blokir klik kanan (mouse). Windows via keyboard lib, lainnya via pynput."""
-    if HAS_PYNPUT_MOUSE:
-        try:
-            def on_click(x, y, button, pressed):
-                if pressed and button == pyn_mouse.Button.right:
-                    return False  # suppress
-            listener = pyn_mouse.Listener(on_click=on_click, suppress=True)
-            listener.daemon = True
-            listener.start()
-            return listener
-        except Exception:
-            return None
-    return None
-
-
-# Exit hotkey callback - akan di-override oleh CakBroApp
-_exit_hotkey_cb = None
-def _exit_hotkey_pressed():
-    if _exit_hotkey_cb:
-        try: _exit_hotkey_cb()
-        except Exception: pass
 
 
 # ============================================================
@@ -715,7 +884,6 @@ def _exit_hotkey_pressed():
 # ============================================================
 class CakBroApp:
     def __init__(self):
-        # state
         self.browser_path = ""
         self.browser_type = ""
         self.browser_name = ""
@@ -728,7 +896,6 @@ class CakBroApp:
         self.is_home_resetting = False
         self.is_exiting = False
 
-        # bridge
         self.bridge_active = False
         self.bridge_base_remaining = 0
         self.bridge_base_token_wait = 0
@@ -741,7 +908,6 @@ class CakBroApp:
         self.warn5_shown = False
         self.warn1_shown = False
 
-        # ui
         self.root = tk.Tk()
         self.root.withdraw()
         self.bar_win: Optional[tk.Toplevel] = None
@@ -757,22 +923,17 @@ class CakBroApp:
         self.expired_auto_home_at = 0.0
         self.warning_minutes = 0
 
-        # geometry
         self.mon_w = self.root.winfo_screenwidth()
         self.mon_h = self.root.winfo_screenheight()
         self.browser_h = self.mon_h - BAR_HEIGHT
 
-        # hotkey listener (keep reference!)
         self._hotkey_handle = None
-        self._mouse_handle = None
 
-        # register exit callback
         global _exit_hotkey_cb
         _exit_hotkey_cb = self.trigger_exit
 
     # ---------------- lifecycle ----------------
     def run(self):
-        # cek update SEBELUM meluncurkan browser
         if check_for_update_and_apply():
             self.cleanup(is_applying_update=True)
             sys.exit(0)
@@ -802,7 +963,7 @@ class CakBroApp:
                                  "Install salah satu: Edge / Chrome / Brave / Firefox")
             sys.exit(1)
         self.browser_path, self.browser_type, self.browser_name, self.browser_exe = p, t, n, e
-        log_update(f"Browser terdeteksi: {n} -> {p}")
+        log_info(f"Browser: {n} -> {p}")
 
     def kill_existing_browsers(self):
         taskkill_names(["msedge.exe", "chrome.exe", "brave.exe", "firefox.exe",
@@ -812,11 +973,11 @@ class CakBroApp:
     def _profile_dir(self) -> Path:
         return app_dir() / "CakBroProfile"
 
-    def _write_firefox_user_js(self, data_dir_: Path):
-        user_js = data_dir_ / "user.js"
-        if user_js.exists():
+    def _write_firefox_user_js(self, d: Path):
+        uj = d / "user.js"
+        if uj.exists():
             return
-        content = "\n".join([
+        uj.write_text("\n".join([
             'user_pref("browser.shell.checkDefaultBrowser", false);',
             'user_pref("browser.translations.enable", false);',
             'user_pref("browser.translations.automaticallyPopup", false);',
@@ -826,14 +987,13 @@ class CakBroApp:
             'user_pref("signon.rememberSignons", false);',
             'user_pref("browser.download.promptForDownload", false);',
             'user_pref("app.update.auto", false);',
-        ])
-        user_js.write_text(content, encoding="utf-8")
+        ]), encoding="utf-8")
 
     def _write_chromium_prefs(self, profile: Path):
-        prefs_dir = profile / "Default"
-        prefs_dir.mkdir(parents=True, exist_ok=True)
-        prefs_file = prefs_dir / "Preferences"
-        if prefs_file.exists():
+        pd = profile / "Default"
+        pd.mkdir(parents=True, exist_ok=True)
+        pf = pd / "Preferences"
+        if pf.exists():
             return
         data = {
             "translate": {"enabled": False},
@@ -852,7 +1012,7 @@ class CakBroApp:
             "signin": {"allowed": False},
             "enable_do_not_track": True,
         }
-        prefs_file.write_text(json.dumps(data, indent=2), encoding="utf-8")
+        pf.write_text(json.dumps(data, indent=2), encoding="utf-8")
 
     def launch_browser(self):
         if self.browser_type == "firefox":
@@ -860,7 +1020,6 @@ class CakBroApp:
         else:
             self._launch_chromium()
 
-        # tunggu window
         deadline = time.time() + 15
         while time.time() < deadline:
             if self.browser_proc and self.browser_proc.poll() is not None:
@@ -879,16 +1038,12 @@ class CakBroApp:
         self._setup_browser_window()
 
     def _launch_firefox(self):
-        data_dir_ = self._profile_dir() / "Firefox"
-        data_dir_.mkdir(parents=True, exist_ok=True)
-        self._write_firefox_user_js(data_dir_)
-        cmd = [
-            self.browser_path,
-            "-kiosk", self.exam_url,
-            "-profile", str(data_dir_),
-            "-no-remote",
-        ]
-        log_update(f"Launch Firefox: {' '.join(cmd)}")
+        dd = self._profile_dir() / "Firefox"
+        dd.mkdir(parents=True, exist_ok=True)
+        self._write_firefox_user_js(dd)
+        cmd = [self.browser_path, "-kiosk", self.exam_url,
+               "-profile", str(dd), "-no-remote"]
+        log_info(f"Launch Firefox: {' '.join(cmd)}")
         self.browser_proc = subprocess.Popen(cmd)
 
     def _launch_chromium(self):
@@ -896,17 +1051,37 @@ class CakBroApp:
         profile.mkdir(parents=True, exist_ok=True)
         self._write_chromium_prefs(profile)
 
-        cmd = [self.browser_path]
-        cmd += ["--kiosk", self.exam_url]
+        cmd = [self.browser_path,
+               "--kiosk", self.exam_url]
         if self.browser_type == "edge":
             cmd += ["--edge-kiosk-type=fullscreen"]
-        cmd += ["--app=" + self.exam_url]
-        cmd += ["--start-fullscreen"]
-        cmd += [f"--window-size={self.mon_w},{self.browser_h}"]
-        cmd += ["--window-position=0,0"]
-        cmd += [f"--user-data-dir={profile}"]
-        cmd += ["--disable-translate", "--disable-features=TranslateUI,Translate",
-                "AutofillServerCommunication,OverlayScrollbar"]
+        cmd += [
+            f"--app={self.exam_url}",
+            "--start-fullscreen",
+            f"--window-size={self.mon_w},{self.browser_h}",
+            "--window-position=0,0",
+            f"--user-data-dir={profile}",
+            "--disable-translate",
+            "--disable-features=TranslateUI,Translate,AutofillServerCommunication,OverlayScrollbar",
+            "--lang=id", "--accept-lang=id",
+            "--disable-notifications", "--disable-popup-blocking",
+            "--disable-infobars", "--disable-extensions",
+            "--disable-component-update", "--disable-background-networking",
+            "--disable-sync", "--disable-default-apps",
+            "--disable-client-side-phishing-detection",
+            "--disable-domain-reliability", "--disable-hang-monitor",
+            "--disable-prompt-on-repost", "--disable-session-crashed-bubble",
+            "--disable-background-timer-throttling",
+            "--disable-offer-store-unmasked-wallet-cards",
+            "--disable-offer-upload-credit-cards",
+            "--no-first-run", "--no-default-browser-check", "--no-service-autorun",
+            "--disable-save-password-bubble", "--disable-single-click-autofill",
+            "--password-store=basic", "--disable-breakpad",
+            "--metrics-recording-only", "--safebrowsing-disable-auto-update",
+            "--autoplay-policy=no-user-gesture-required",
+            "--disable-ipc-flooding-protection",
+            "--bookmark-bar-ntp=hidden",
+        ]
         if self.browser_type == "edge":
             cmd += ["--disable-features=" + ",".join([
                 "msTranslateCompactMenu", "msEdgeSidebarV2", "msEdgeDiscoverBar",
@@ -918,25 +1093,7 @@ class CakBroApp:
                 "msEdgeAutoImport", "msEnableTranslatePageContextMenu",
                 "msEdgeHubAppHost", "msEdgeOnRamp", "msCompactTranslate",
             ])]
-        cmd += ["--lang=id", "--accept-lang=id"]
-        cmd += ["--disable-notifications", "--disable-popup-blocking",
-                "--disable-infobars", "--disable-extensions",
-                "--disable-component-update", "--disable-background-networking",
-                "--disable-sync", "--disable-default-apps",
-                "--disable-client-side-phishing-detection",
-                "--disable-domain-reliability", "--disable-hang-monitor",
-                "--disable-prompt-on-repost", "--disable-session-crashed-bubble",
-                "--disable-background-timer-throttling",
-                "--disable-offer-store-unmasked-wallet-cards",
-                "--disable-offer-upload-credit-cards",
-                "--no-first-run", "--no-default-browser-check", "--no-service-autorun",
-                "--disable-save-password-bubble", "--disable-single-click-autofill",
-                "--password-store=basic", "--disable-breakpad",
-                "--metrics-recording-only", "--safebrowsing-disable-auto-update",
-                "--autoplay-policy=no-user-gesture-required",
-                "--disable-ipc-flooding-protection",
-                "--bookmark-bar-ntp=hidden"]
-        log_update(f"Launch Chromium: {' '.join(cmd)}")
+        log_info(f"Launch Chromium: {' '.join(cmd)}")
         self.browser_proc = subprocess.Popen(cmd)
 
     def _find_browser_hwnd(self) -> Optional[int]:
@@ -949,8 +1106,7 @@ class CakBroApp:
     def _setup_browser_window(self):
         if not self.browser_proc:
             return
-        pid = self.browser_proc.pid
-        resize_external_window(pid, 0, 0, self.mon_w, self.browser_h)
+        resize_external_window(self.browser_proc.pid, 0, 0, self.mon_w, self.browser_h)
 
     # ---------------- splash ----------------
     def show_splash(self):
@@ -962,7 +1118,6 @@ class CakBroApp:
         x = (self.mon_w - W) // 2
         y = (self.mon_h - H) // 2
         sp.geometry(f"{W}x{H}+{x}+{y}")
-
         tk.Frame(sp, bg=ACCENT_COLOR, height=3).pack(fill="x")
         tk.Label(sp, text="CakBro", fg=ACCENT_COLOR, bg="#0d1117",
                  font=("Segoe UI", 28, "bold")).pack(pady=(20, 0))
@@ -973,7 +1128,6 @@ class CakBroApp:
                  fg="#888888", bg="#0d1117", font=("Segoe UI", 9)).pack()
         tk.Label(sp, text=f"v{APP_VERSION} — Powered by Pakkar",
                  fg="#444444", bg="#0d1117", font=("Consolas", 8)).pack(pady=(8, 0))
-
         self.root.update_idletasks()
         sp.update()
         time.sleep(2.5)
@@ -988,25 +1142,19 @@ class CakBroApp:
         y = self.mon_h - BAR_HEIGHT
         self.bar_win.geometry(f"{self.mon_w}x{BAR_HEIGHT}+0+{y}")
 
-        # top accent
         tk.Frame(self.bar_win, bg=ACCENT_COLOR, height=2).pack(fill="x", side="top")
-
         inner = tk.Frame(self.bar_win, bg=BAR_COLOR, height=BAR_HEIGHT - 2)
         inner.pack(fill="both", expand=True)
         inner.pack_propagate(False)
 
         tk.Label(inner, text=f"CakBro V{APP_VERSION}", fg=BAR_TEXT_COLOR, bg=BAR_COLOR,
                  font=("Segoe UI", 11, "bold")).pack(side="left", padx=(14, 10))
-
         tk.Frame(inner, bg="#444444", width=1).pack(side="left", fill="y", pady=8, padx=4)
-
         tk.Button(inner, text="⟳ Refresh", command=self.refresh_browser,
                   bg="#0f3460", fg="white", activebackground="#1c4a86",
                   activeforeground="white", relief="flat", bd=0,
                   font=("Segoe UI", 10), padx=12, pady=2).pack(side="left", padx=8)
-
         tk.Frame(inner, bg="#444444", width=1).pack(side="left", fill="y", pady=8, padx=4)
-
         tk.Label(inner, textvariable=self.status_var, fg="#E2E8F0", bg=BAR_COLOR,
                  font=("Segoe UI", 9, "bold")).pack(side="left", expand=True, padx=10)
 
@@ -1015,41 +1163,38 @@ class CakBroApp:
                                   activeforeground="white", relief="flat", bd=0,
                                   font=("Segoe UI", 9, "bold"), padx=14, pady=2)
         self.home_btn.pack(side="right", padx=6)
-        self.home_btn.pack_forget()  # hidden by default
+        self.home_btn.pack_forget()
 
         tk.Label(inner, text="Pakkar", fg="#4ade80", bg=BAR_COLOR,
                  font=("Segoe UI", 9)).pack(side="right", padx=10)
-
         tk.Label(inner, textvariable=self.clock_var, fg="#AAAAAA", bg=BAR_COLOR,
                  font=("Consolas", 12)).pack(side="right", padx=14)
 
-    # ---------------- hotkey ----------
+    # ---------------- blocking ----------------
     def setup_blocking(self):
-        self._hotkey_handle = setup_hotkey_blocker()
-        self._mouse_handle = block_context_menu()
+        self._hotkey_handle = setup_hotkeys()
+        if IS_WINDOWS and not _is_admin_windows():
+            print("[WARN] CakBro TIDAK berjalan sebagai Administrator.")
+            print("       Blokir tombol Windows/Alt+Tab SUPPRESS mungkin terbatas.")
+            print("       Untuk kiosk penuh, jalankan sebagai Admin.")
 
     # ---------------- timers ----------------
     def security_check(self):
         if self.is_exiting:
             return
         hide_taskbar()
-
-        # restart browser bila mati (kecuali saat reset home)
         if not self.is_home_resetting and self.browser_proc:
             if self.browser_proc.poll() is not None:
                 time.sleep(0.5)
                 self.kill_existing_browsers()
                 time.sleep(0.3)
                 self.launch_browser()
-
-        # kill aplikasi terlarang
         forbidden = ["taskmgr.exe", "cmd.exe", "powershell.exe", "WindowsTerminal.exe",
                      "snippingtool.exe", "ScreenSketch.exe", "ScreenClippingHost.exe",
                      "regedit.exe", "control.exe", "mmc.exe", "osk.exe",
                      "calc.exe", "notepad.exe", "mspaint.exe",
                      "wmplayer.exe", "vlc.exe"]
         taskkill_names(forbidden)
-
         self.root.after(500, self.security_check)
 
     def update_clock(self):
@@ -1064,16 +1209,11 @@ class CakBroApp:
                 self.bar_win.lift()
             except Exception:
                 pass
-
         if self.is_exiting or self.is_home_resetting:
             self.root.after(300, self.keep_focus)
             return
-
-        # tetap resize browser ke area yang benar (di atas bar)
         if self.browser_proc and self.browser_proc.poll() is None:
             resize_external_window(self.browser_proc.pid, 0, 0, self.mon_w, self.browser_h)
-
-        # overlay tetap di atas
         if self.expired_win and self.expired_win.winfo_exists():
             try:
                 self.expired_win.attributes("-topmost", True)
@@ -1086,10 +1226,9 @@ class CakBroApp:
                 self.warning_win.lift()
             except Exception:
                 pass
-
         self.root.after(300, self.keep_focus)
 
-    # ---------------- bridge (window-title polling) ----------------
+    # ---------------- bridge ----------------
     def poll_bridge(self):
         if not self.is_home_resetting:
             titles = enum_window_titles()
@@ -1101,9 +1240,12 @@ class CakBroApp:
                 m = re.match(r"^(ON|OFF)\|(\d+)\|(\d+)\|([A-Za-z0-9_-]*)\|", payload)
                 if not m:
                     continue
-                state, rem, token_wait, token = m.group(1), int(m.group(2)), int(m.group(3)), m.group(4)
-                if token == "-":
-                    token = ""
+                state = m.group(1)
+                rem = int(m.group(2))
+                tw = int(m.group(3))
+                tok = m.group(4)
+                if tok == "-":
+                    tok = ""
                 if state == "OFF":
                     self.bridge_active = False
                     self.bridge_base_remaining = 0
@@ -1112,21 +1254,23 @@ class CakBroApp:
                     self.bridge_sync_tick = 0.0
                 else:
                     if not self.bridge_active:
-                        elapsed = int((time.time() - self.bridge_last_sync_tick)) if self.bridge_last_sync_tick else 0
-                        expected = self.bridge_last_remaining - elapsed if self.bridge_last_remaining >= 0 else -1
-                        if (self.bridge_last_remaining < 0 or token != self.bridge_last_token
+                        elapsed = (int(time.time() - self.bridge_last_sync_tick)
+                                   if self.bridge_last_sync_tick else 0)
+                        expected = (self.bridge_last_remaining - elapsed
+                                    if self.bridge_last_remaining >= 0 else -1)
+                        if (self.bridge_last_remaining < 0
+                                or tok != self.bridge_last_token
                                 or rem > expected + 5):
                             self.warn5_shown = False
                             self.warn1_shown = False
                     self.bridge_active = True
                     self.bridge_base_remaining = rem
-                    self.bridge_base_token_wait = token_wait
-                    self.bridge_token = token
+                    self.bridge_base_token_wait = tw
+                    self.bridge_token = tok
                     self.bridge_sync_tick = time.time()
                     self.bridge_last_remaining = rem
                     self.bridge_last_sync_tick = self.bridge_sync_tick
-                    self.bridge_last_token = token
-
+                    self.bridge_last_token = tok
                     if rem <= 0 and not self.is_exam_expired:
                         self.is_exam_expired = True
                         self.show_expired_overlay()
@@ -1160,7 +1304,6 @@ class CakBroApp:
                 show_home = True
             else:
                 text = f"Sisa {time_text} | Token belum diatur"
-
             if 0 < remaining <= 60 and not self.warn1_shown:
                 self.warn1_shown = True
                 self.warning_minutes = 1
@@ -1169,10 +1312,7 @@ class CakBroApp:
                 self.warn5_shown = True
                 self.warning_minutes = 5
                 self.show_time_warning()
-
         self.status_var.set(text)
-
-        # update tombol
         try:
             if self.is_exam_expired or (self.warning_win and self.warning_win.winfo_exists()):
                 self.home_btn.pack_forget()
@@ -1193,17 +1333,14 @@ class CakBroApp:
         else:
             self.warning_head_var.set("Waktu ujian tersisa 5 menit")
             self.warning_body_var.set("Pastikan jawaban sudah lengkap dan dikirim sebelum waktu habis.")
-
         if self.warning_win and self.warning_win.winfo_exists():
             return
-
         w = tk.Toplevel(self.root)
         w.overrideredirect(True)
         w.configure(bg="#101827")
         w.attributes("-topmost", True)
         w.attributes("-alpha", 0.86)
         w.geometry(f"{self.mon_w}x{self.browser_h}+0+0")
-
         tk.Label(w, textvariable=self.warning_head_var, fg="white", bg="#101827",
                  font=("Segoe UI", 22, "bold")).pack(pady=(self.browser_h // 2 - 90, 0))
         tk.Label(w, textvariable=self.warning_body_var, fg="#E2E8F0", bg="#101827",
@@ -1230,23 +1367,19 @@ class CakBroApp:
         if self.warning_win and self.warning_win.winfo_exists():
             self.warning_win.destroy()
             self.warning_win = None
-
         self.expired_auto_home_at = time.time() + 5
-
         w = tk.Toplevel(self.root)
         w.overrideredirect(True)
         w.configure(bg="#101827")
         w.attributes("-topmost", True)
         w.attributes("-alpha", 0.86)
         w.geometry(f"{self.mon_w}x{self.browser_h}+0+0")
-
         tk.Label(w, text="Waktu ujian telah berakhir", fg="white", bg="#101827",
                  font=("Segoe UI", 24, "bold")).pack(pady=(self.browser_h // 2 - 150, 0))
         tk.Label(w, text="Akses ke formulir ujian telah dihentikan.",
                  fg="#E2E8F0", bg="#101827", font=("Segoe UI", 12)).pack(pady=(10, 0))
-        tk.Label(w,
-                 text=("Jika tidak ditekan, browser ditutup dan profil/cookie kiosk dihapus.\n"
-                       "Jawaban yang belum dikirim bisa hilang."),
+        tk.Label(w, text=("Jika tidak ditekan, browser ditutup dan profil/cookie kiosk dihapus.\n"
+                          "Jawaban yang belum dikirim bisa hilang."),
                  fg="#E2E8F0", bg="#101827", font=("Segoe UI", 10),
                  wraplength=self.mon_w - 80, justify="center").pack(pady=(14, 0))
         tk.Label(w, textvariable=self.expired_countdown_var, fg="#FBBF24",
@@ -1256,7 +1389,6 @@ class CakBroApp:
                   relief="flat", bd=0, font=("Segoe UI", 11, "bold"),
                   padx=30, pady=8).pack(pady=14)
         self.expired_win = w
-
         self._tick_expired_countdown()
 
     def _tick_expired_countdown(self):
@@ -1269,7 +1401,7 @@ class CakBroApp:
             return
         self.root.after(500, self._tick_expired_countdown)
 
-    # ---------------- home reset ----------------
+    # ---------------- home ----------------
     def return_home_from_bar(self):
         if self.is_home_resetting:
             return
@@ -1295,8 +1427,6 @@ class CakBroApp:
         if self.is_home_resetting:
             return
         self.is_home_resetting = True
-
-        # reset state
         self.bridge_active = False
         self.bridge_base_remaining = 0
         self.bridge_base_token_wait = 0
@@ -1308,7 +1438,6 @@ class CakBroApp:
         self.bridge_last_remaining = -1
         self.bridge_last_sync_tick = 0.0
         self.bridge_last_token = ""
-
         if self.warning_win and self.warning_win.winfo_exists():
             self.warning_win.destroy()
             self.warning_win = None
@@ -1317,7 +1446,6 @@ class CakBroApp:
             self.expired_win = None
         self._update_bar_status()
 
-        # kill browser
         if self.browser_proc:
             kill_process_tree(self.browser_proc.pid)
             try:
@@ -1327,7 +1455,6 @@ class CakBroApp:
         taskkill_names(["msedge.exe", "chrome.exe", "brave.exe", "firefox.exe",
                         "msedge", "chrome", "brave", "firefox"])
 
-        # hapus profil kiosk
         profile = self._profile_dir()
         if profile.exists():
             ok = False
@@ -1339,25 +1466,19 @@ class CakBroApp:
                 except Exception:
                     time.sleep(0.5)
             if not ok:
-                self._topmost_msgbox(
-                    "error",
-                    "Profil kiosk tidak berhasil dihapus. Browser tidak dibuka ulang "
-                    "agar sesi login lama tidak tertinggal."
-                )
+                self._topmost_msgbox("error",
+                    "Profil kiosk tidak berhasil dihapus. Browser tidak dibuka ulang.")
                 self.cleanup()
                 sys.exit(1)
-
         self.browser_proc = None
         self.browser_pid = 0
         time.sleep(0.7)
 
-        # reload dengan nonce
         base = EXAM_URL
         sep = "&" if "?" in base else "?"
         self.exam_url = f"{base}{sep}ahkHomeReset={int(time.time()*1000)}"
         self.launch_browser()
         self.exam_url = base
-
         self.is_home_resetting = False
         self._update_bar_status()
 
@@ -1369,58 +1490,83 @@ class CakBroApp:
             return
         if not self.browser_proc or self.browser_proc.poll() is not None:
             return
-        # aktifkan window browser, kirim F5 via keyboard library
-        if HAS_KB:
+        # Kirim F5 via SendInput (native, tidak pakai `keyboard`)
+        if IS_WINDOWS:
             try:
-                kb_lib.send("f5")
+                hwnd = find_window_by_pid_windows(self.browser_proc.pid)
+                if hwnd:
+                    ctypes.windll.user32.SetForegroundWindow(hwnd)
+                VK_F5 = 0x74
+                KEYEVENTF_KEYUP = 0x0002
+                ctypes.windll.user32.keybd_event(VK_F5, 0, 0, 0)
+                ctypes.windll.user32.keybd_event(VK_F5, 0, KEYEVENTF_KEYUP, 0)
             except Exception:
                 pass
 
     # ---------------- exit ----------------
     def trigger_exit(self):
+        """Aman dari thread manapun."""
+        try:
+            self.root.after(0, self._real_trigger_exit)
+        except Exception as e:
+            log_update(f"trigger_exit schedule gagal: {e}")
+
+    def _real_trigger_exit(self):
         if self.is_exiting:
             return
         self.is_exiting = True
+        if IS_WINDOWS:
+            try:
+                import winsound
+                winsound.Beep(850, 180)
+                time.sleep(0.05)
+                winsound.Beep(1100, 120)
+            except Exception:
+                pass
         try:
-            if HAS_KB:
-                kb_lib.send("space")
-        except Exception:
-            pass
-
-        yes = messagebox.askyesno(
-            "CakBro - Konfirmasi Keluar",
-            "Apakah Anda yakin ingin keluar dari aplikasi?\n\n"
-            "Tekan [Yes] untuk keluar dari ujian."
-        )
+            yes = messagebox.askyesno(
+                "CakBro - Konfirmasi Keluar",
+                "Apakah Anda yakin ingin keluar dari aplikasi?\n\n"
+                "Tekan [Yes] untuk keluar dari ujian."
+            )
+        except Exception as e:
+            log_update(f"messagebox gagal: {e}; force exit.")
+            yes = True
         if yes:
             self.cleanup()
+            try:
+                self.root.quit()
+            except Exception:
+                pass
             sys.exit(0)
         self.is_exiting = False
 
     def cleanup(self, is_applying_update=False):
+        global _win_hotkey_mgr
+        if _win_hotkey_mgr:
+            try:
+                _win_hotkey_mgr.stop()
+            except Exception:
+                pass
+            _win_hotkey_mgr = None
         try:
-            if self._hotkey_handle and HAS_KB:
-                try: kb_lib.unhook_all()
-                except Exception: pass
+            if HAS_KB and kb_lib:
+                kb_lib.unhook_all()
         except Exception:
             pass
-
         if is_applying_update:
             show_taskbar()
             return
-
         if self.browser_proc:
             kill_process_tree(self.browser_proc.pid)
         taskkill_names(["msedge.exe", "chrome.exe", "brave.exe", "firefox.exe",
                         "msedge", "chrome", "brave", "firefox"])
         show_taskbar()
-
         try:
             self.root.quit()
         except Exception:
             pass
 
-    # ---------------- helpers ----------------
     def _topmost_msgbox(self, kind: str, msg: str):
         top = tk.Toplevel(self.root)
         top.attributes("-topmost", True)
@@ -1437,13 +1583,10 @@ class CakBroApp:
 # ============================================================
 def main():
     if not HAS_PSUTIL:
-        print("[WARN] psutil belum terinstall. Proses tidak akan di-kill otomatis.")
+        print("[WARN] psutil belum terinstall — proses tidak akan di-kill otomatis.")
     if not HAS_REQUESTS:
-        print("[WARN] requests belum terinstall. Update check memakai urllib.")
-    if not HAS_KB:
-        print("[WARN] 'keyboard' belum terinstall. Hotkey blocker nonaktif.")
+        print("[WARN] requests belum terinstall — update pakai urllib.")
 
-    # signal handler untuk cleanup
     app = CakBroApp()
 
     def _sig(_signum, _frame):
@@ -1452,6 +1595,7 @@ def main():
         except Exception:
             pass
         sys.exit(0)
+
     try:
         signal.signal(signal.SIGINT, _sig)
         signal.signal(signal.SIGTERM, _sig)
